@@ -145,7 +145,6 @@ class FeatureUNET(nn.Module):
 
     def forward(self, x): 
         residuals = []
-        multi_scale_features = []
 
         x = self.conv_in_proj(x)
         residuals.append(x)  
@@ -164,30 +163,11 @@ class FeatureUNET(nn.Module):
         # --- BOTTLENECK ---
         for module in self.bottleneck:
             x = module(x) 
-            
-        # HINWEIS: Hier im Keller speichern wir NICHTS mehr ab! 
-        # Das Signal geht erst in den Decoder, um dein "Kandidat 2" zu werden.
 
         # --- DECODER ---
-        upsample_count = 0
         for module in self.decoder:
-            
             # WENN EIN AUFZUG KOMMT:
             if isinstance(module, UpsampleBlock):
-                upsample_count += 1
-                
-                # 🎯 MESSFÜHLER 1 (Grob - Dein Kandidat 2)
-                # Das Signal ist 72x96 und hat die Skip-Connection aus dem Keller verdaut.
-                # Wir speichern es ab, BEVOR es vergrößert wird!
-                if upsample_count == 1:
-                    multi_scale_features.append(x)
-                    
-                # 🎯 MESSFÜHLER 2 (Mittel - Dein Kandidat 3)
-                # Das Signal ist 144x192 und hat die zweite Skip-Connection verdaut.
-                elif upsample_count == 2:
-                    multi_scale_features.append(x)
-                    
-                # Jetzt darf das Modul das Bild vergrößern
                 x = module(x)
                 
             # WENN EIN NORMALER BLOCK KOMMT:
@@ -207,8 +187,7 @@ class FeatureUNET(nn.Module):
         # --- OUTPUT ---
         x = self.conv_out_proj(x)
         
-        # 🎯 MESSFÜHLER 3 (Fein - Dein Kandidat 4)
-        # Volle 576x768 Pixel. Die absolute Endausgabe des Modells.
-        multi_scale_features.append(x)
-        
-        return multi_scale_features
+        # 🎯 MESSFÜHLER (Fein)
+        # Volle Auflösung. Wird als Liste mit einem Element zurückgegeben, 
+        # um die Schnittstelle nicht komplett umbauen zu müssen.
+        return [x]

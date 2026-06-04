@@ -19,7 +19,7 @@ class ContourDiffusionModel(nn.Module):
         self.coord_mlp = nn.Linear(2, hidden_dim)
         
         # 3. Zeit-gesteuerter Feature-Mixer
-        self.multi_scale_dim = 256 + 128 + 64 
+        self.multi_scale_dim = 64
         
         # --- FIX: DAS FUSION MLP WIRD GRÖßER ---
         # Es empfängt jetzt: Lokale Features (448) + Globale Features (448) + Zeit (128)
