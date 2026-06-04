@@ -148,62 +148,93 @@ class PH2ContourDataset(Dataset):
         # --- C. KOORDINATEN NORMALISIEREN [-1, 1] ---
         # ACHTUNG: PyTorch img_size ist (Höhe, Breite). 
         # OpenCV Punkte sind aber (X=Breite, Y=Höhe).
-        H, W = self.img_size # Hier richtig entpacken!
+        # --- C. KOORDINATEN NORMALISIEREN [-1, 1] ---
+        H, W = self.img_size 
         
         points_norm = points.astype(np.float32)
-        
-        # X-Koordinaten (Breite) normalisieren
         points_norm[:, 0] = points_norm[:, 0] / (W - 1)
-        # Y-Koordinaten (Höhe) normalisieren
         points_norm[:, 1] = points_norm[:, 1] / (H - 1)
-        
         points_norm = points_norm * 2.0 - 1.0
 
         points_tensor = torch.tensor(points_norm, dtype=torch.float32)
 
-        return img_tensor, points_tensor
+        # --- D. MASKE STRUKTURELL VERRAUSCHEN ---
+        # WICHTIG: Die Punkte wurden bereits aus der perfekten mask_binary berechnet!
+        # Jetzt degradieren wir die Maske für das U-Net.
+        
+        degraded_mask = mask_binary.copy()
+        
+        # In ca. 80 % der Fälle die Maske strukturell verschlechtern
+        if random.random() < 0.8:
+            # Zufällige Kernel-Größe (z.B. 5x5 bis 15x15 Pixel) für unterschiedlich starke Verzerrung
+            k_size = random.randint(5, 15)
+            kernel = np.ones((k_size, k_size), np.uint8)
+            
+            # Zufällige morphologische Operation wählen
+            op_choice = random.choice(['dilate', 'erode', 'close', 'open'])
+            
+            if op_choice == 'dilate':
+                # Lässt die Maske wachsen (Kante liegt zu weit außen)
+                degraded_mask = cv2.dilate(degraded_mask, kernel, iterations=random.randint(1, 2))
+            elif op_choice == 'erode':
+                # Lässt die Maske schrumpfen (Kante liegt zu weit innen)
+                degraded_mask = cv2.erode(degraded_mask, kernel, iterations=random.randint(1, 2))
+            elif op_choice == 'close':
+                # Schließt Löcher, macht den Rand oft klobiger und ungenauer
+                degraded_mask = cv2.morphologyEx(degraded_mask, cv2.MORPH_CLOSE, kernel, iterations=random.randint(1, 2))
+            elif op_choice == 'open':
+                # Reißt kleine Strukturen weg, rundet ab
+                degraded_mask = cv2.morphologyEx(degraded_mask, cv2.MORPH_OPEN, kernel, iterations=random.randint(1, 2))
+
+        # Den Tensor jetzt aus der VERRAUSCHTEN Maske erstellen!
+        mask_tensor = torch.tensor(degraded_mask / 255.0, dtype=torch.float32).unsqueeze(0)  # [1, H, W]
+        
+        return img_tensor, points_tensor, mask_tensor
     
     
+
     @staticmethod
-    def verify_dataset(batch_images, batch_points, num_samples=4):
+    def verify_dataset(batch_images, batch_points, batch_masks, num_samples=4):
         """
-        Plottet Bilder und Punkte aus dem PyTorch DataLoader zur Überprüfung.
+        Plottet Bilder, Masken und Punkte aus dem PyTorch DataLoader zur Überprüfung.
         batch_images: Tensor der Form (B, 3, H, W) im Bereich [-1, 1]
         batch_points: Tensor der Form (B, n_punkte, 2) im Bereich [-1, 1]
+        batch_masks: Tensor der Form (B, 1, H, W) im Bereich [0, 1]
         """
         # Sicherstellen, dass wir nicht mehr Samples plotten, als im Batch sind
         batch_size, channels, H, W = batch_images.shape
         num_samples = min(batch_size, num_samples)
-
-        fig, axes = plt.subplots(1, num_samples, figsize=(16, 5))
+        # 2 Zeilen (Bild oben, Maske unten)
+        fig, axes = plt.subplots(2, num_samples, figsize=(16, 10))
+        
+        # Fallback, falls nur 1 Bild geplottet wird, damit das axes-Array 2D bleibt
         if num_samples == 1:
-            axes = [axes] # Fallback, falls nur 1 Bild geplottet wird
-
+            axes = axes[:, np.newaxis] 
         for i in range(num_samples):
             # --- 1. BILD DENORMALISIEREN ---
-            # Von [-1, 1] zurück auf [0, 1] für Matplotlib
-            img = batch_images[i].cpu().numpy()
-            # Form ändern von (3, H, W) zu (H, W, 3)
-            img = img.transpose(1, 2, 0)
+            img = batch_images[i].cpu().numpy().transpose(1, 2, 0)
             img = (img * 0.5) + 0.5 
-            img = np.clip(img, 0, 1) # Sicherheitshalber auf 0-1 abschneiden
-
-            # --- 2. PUNKTE DENORMALISIEREN ---
-            # Von [-1, 1] zurück auf absolute Pixelkoordinaten
+            img = np.clip(img, 0, 1)
+            
+            # --- 2. MASKE ENTPACKEN ---
+            # Shape von (1, H, W) auf (H, W) reduzieren für Matplotlib
+            mask = batch_masks[i].cpu().numpy().squeeze()
+            # --- 3. PUNKTE DENORMALISIEREN ---
             pts = batch_points[i].cpu().numpy()
             pts_x = (pts[:, 0] + 1.0) / 2.0 * (W - 1)
             pts_y = (pts[:, 1] + 1.0) / 2.0 * (H - 1)
-
-            # --- 3. PLOTTEN ---
-            axes[i].imshow(img)
-            # Punkte als rote Punkte ('r.') und mit Linien verbunden ('-') zeichnen
-            axes[i].plot(pts_x, pts_y, 'r.-', markersize=3, linewidth=1)
-
-            # Die Kontur optisch schließen (letzten Punkt mit erstem verbinden)
-            axes[i].plot([pts_x[-1], pts_x[0]], [pts_y[-1], pts_y[0]], 'r-', linewidth=1)
-
-            axes[i].axis("off")
-            axes[i].set_title(f"Sample {i+1}")
-
+            # --- 4. PLOTTEN (ZEILE 1: BILD) ---
+            axes[0, i].imshow(img)
+            axes[0, i].plot(pts_x, pts_y, 'r.-', markersize=3, linewidth=1)
+            axes[0, i].plot([pts_x[-1], pts_x[0]], [pts_y[-1], pts_y[0]], 'r-', linewidth=1)
+            axes[0, i].axis("off")
+            axes[0, i].set_title(f"Sample {i+1} (RGB)")
+            # --- 5. PLOTTEN (ZEILE 2: MASKE) ---
+            axes[1, i].imshow(mask, cmap='gray')
+            # Grüne Punkte zur besseren Sichtbarkeit auf schwarz/weiß
+            axes[1, i].plot(pts_x, pts_y, 'g.-', markersize=3, linewidth=1)
+            axes[1, i].plot([pts_x[-1], pts_x[0]], [pts_y[-1], pts_y[0]], 'g-', linewidth=1)
+            axes[1, i].axis("off")
+            axes[1, i].set_title(f"Sample {i+1} (Maske)")
         plt.tight_layout()
         plt.show()
