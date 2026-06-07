@@ -1,8 +1,11 @@
+# This Dataset is being used for finetuning
+
 import random
 import os
+import PIL
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
-import PIL.Image as Image
+import PIL.Image as Image   
 import torchvision.transforms.functional as TF
 import cv2
 import torch
@@ -34,6 +37,33 @@ def uniform_sampling(contour, n):
     local_t = (t - s[idx]) / seg_len[idx]
 
     return contour[idx] + seg[idx] * local_t[:, None]
+
+# Ganz oben in der Datei ergänzen
+from scipy.ndimage import map_coordinates, gaussian_filter
+
+def elastic_deform(image_np, mask_np, alpha=80, sigma=10):
+    """
+    Beide Arrays müssen numpy sein: image_np (H,W,3), mask_np (H,W)
+    """
+    shape = mask_np.shape
+    dx = gaussian_filter(np.random.randn(*shape), sigma) * alpha
+    dy = gaussian_filter(np.random.randn(*shape), sigma) * alpha
+
+    x, y = np.meshgrid(np.arange(shape[1]), np.arange(shape[0]))
+    coords_x = np.clip(x + dx, 0, shape[1]-1)
+    coords_y = np.clip(y + dy, 0, shape[0]-1)
+    indices = [coords_y.ravel(), coords_x.ravel()]
+
+    # Maske mit nearest-neighbor (kein Blending der Binärwerte!)
+    mask_out = map_coordinates(mask_np, indices, order=0).reshape(shape)
+
+    # Bild mit bilinearer Interpolation
+    img_out = np.stack([
+        map_coordinates(image_np[:,:,c], indices, order=1).reshape(shape)
+        for c in range(3)
+    ], axis=-1).astype(np.uint8)
+
+    return img_out, mask_out
 
 class PH2ContourDataset(Dataset):
     def __init__(self, base_path, n_punkte=200, img_size=(256, 256)):
@@ -110,7 +140,60 @@ class PH2ContourDataset(Dataset):
         mask = TF.affine(mask, angle=angle, translate=translate, scale=scale, shear=0)
 
         # 4. Farb-Jitter 
-        img = transforms.ColorJitter(brightness=0.2, contrast=0.2)(img)
+        # ---- NEU: Hue + Saturation Jitter ----
+        img = transforms.ColorJitter(
+            brightness=0.2,
+            contrast=0.2,
+            saturation=0.3,   # NEU — wichtig für Hauttöne
+            hue=0.05          # NEU — kleine Farbverschiebung
+        )(img)
+
+        # ---- NEU: Gaussian Blur (50% Chance) ----
+        if random.random() < 0.5:
+            sigma = random.uniform(0.3, 1.2)
+            img = img.filter(PIL.ImageFilter.GaussianBlur(radius=sigma))
+
+        # ---- NEU: Gaussian Noise (40% Chance) ----
+        if random.random() < 0.4:
+            img_np_noise = np.array(img).astype(np.float32)
+            noise = np.random.randn(*img_np_noise.shape) * random.uniform(3, 12)
+            img = Image.fromarray(np.clip(img_np_noise + noise, 0, 255).astype(np.uint8))
+
+        # ---- NEU: Elastic Deformation (50% Chance) ----
+        # WICHTIG: Vor dem Boundary-Check einfügen — der Guard fängt Fehler ab
+        if random.random() < 0.5:
+            img_np_el = np.array(img)
+            mask_np_el = np.array(mask.convert("L"))
+            img_np_el, mask_np_el = elastic_deform(img_np_el, mask_np_el, alpha=60, sigma=8)
+            img = Image.fromarray(img_np_el)
+            mask = Image.fromarray(mask_np_el)
+
+        # ---- NEU: Random Crop + Resize (40% Chance) ----
+        if random.random() < 0.4:
+            W_orig, H_orig = img.size
+            crop_frac = random.uniform(0.75, 0.95)
+            cw = int(W_orig * crop_frac)
+            ch = int(H_orig * crop_frac)
+            x0 = random.randint(0, W_orig - cw)
+            y0 = random.randint(0, H_orig - ch)
+            img  = img.crop((x0, y0, x0+cw, y0+ch))
+            mask = mask.crop((x0, y0, x0+cw, y0+ch))
+            img  = img.resize((W_orig, H_orig), Image.BILINEAR)
+            mask = mask.resize((W_orig, H_orig), Image.NEAREST)
+
+        # ---- NEU: Cutout (30% Chance) ----
+        # Blockiert einen zufälligen Bereich im BILD (nicht in der Maske)
+        if random.random() < 0.3:
+            img_np_co = np.array(img)
+            H_co, W_co = img_np_co.shape[:2]
+            cut_h = random.randint(20, int(H_co * 0.25))
+            cut_w = random.randint(20, int(W_co * 0.25))
+            cx = random.randint(0, W_co - cut_w)
+            cy = random.randint(0, H_co - cut_h)
+            img_np_co[cy:cy+cut_h, cx:cx+cut_w] = 128  # Grau statt Schwarz → weniger Artefakte
+            img = Image.fromarray(img_np_co)
+
+    
 
         # --- RESIZE FIX ---
         mask = TF.resize(mask, self.img_size, interpolation=transforms.InterpolationMode.NEAREST)

@@ -1,4 +1,18 @@
-/data
-/img_align_celeba
-/PH2Dataset
+# Datensätze
+/data/
+/ISIC2018/
+/Literature Research/
+/pointnet/
+/PointNet_/
+/img_align_celeba/
+/PH2Dataset/
+
+# Modelle
 *.pth
+
+# Bilder
+*.png
+
+# Python Cache
+__pycache__/
+*.py[cod]
