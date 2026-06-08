@@ -1,6 +1,6 @@
 # Datensätze
 /data/
-/ISIC2018/
+/ISIC2017/
 /Literature Research/
 /pointnet/
 /PointNet_/
@@ -16,3 +16,6 @@
 # Python Cache
 __pycache__/
 *.py[cod]
+
+/current_model/
+!current_model/.gitkeep
