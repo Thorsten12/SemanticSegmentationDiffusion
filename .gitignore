@@ -2,3 +2,19 @@
 /img_align_celeba
 /PH2Dataset
 *.pth
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Training artifacts (checkpoints, logs, visualizations)
+src/runs/
+runs/
+*.log
+
+# Editor / tooling
+.vscode/
+.idea/
+.DS_Store
