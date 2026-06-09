@@ -1,21 +1,20 @@
-# Datensätze
-/data/
-/ISIC2017/
-/Literature Research/
-/pointnet/
-/PointNet_/
-/img_align_celeba/
-/PH2Dataset/
-
-# Modelle
+/data
+/img_align_celeba
+/PH2Dataset
 *.pth
 
-# Bilder
-*.png
-
-# Python Cache
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
 
-/current_model/
-!current_model/.gitkeep
+# Training artifacts (checkpoints, logs, visualizations)
+src/runs/
+runs/
+*.log
+
+# Editor / tooling
+.vscode/
+.idea/
+.DS_Store
