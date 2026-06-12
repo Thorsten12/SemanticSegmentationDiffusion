@@ -18,3 +18,8 @@ runs/
 .vscode/
 .idea/
 .DS_Store
+
+# old Data
+/_old_Architecture/
+/gemini_export/
+/Literature Research/
