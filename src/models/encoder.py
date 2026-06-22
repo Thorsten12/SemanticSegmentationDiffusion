@@ -140,6 +140,96 @@ class UNetConditioner(nn.Module):
     def forward(self, image, t):
         return self.unet(image)
 
+class UNetDecoderBlock(nn.Module):
+    """Standard U-Net decoder block: Upsample -> Concat skip -> Conv."""
+    def __init__(self, in_channels, skip_channels, out_channels):
+        super().__init__()
+        self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
+        # Account for concatenated channels from the skip connection
+        combined_channels = in_channels + skip_channels if skip_channels > 0 else in_channels
+        self.conv = nn.Sequential(
+            nn.Conv2d(combined_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(min(8, out_channels), out_channels),
+            nn.SiLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(min(8, out_channels), out_channels),
+            nn.SiLU()
+        )
+
+    def forward(self, x, skip=None):
+        x = self.upsample(x)
+        if skip is not None:
+            x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+
+class BackboneUNetConditioner(_PretrainedPyramid):
+    """Full U-Net conditioner using a pretrained timm backbone as the encoder."""
+
+    def __init__(self, backbone_name="convnext_tiny", pretrained=True, freeze=False, decoder_dim=64):
+        super().__init__()
+        import timm
+        
+        # 1. Setup the pretrained Encoder (e.g., ConvNeXt)
+        self.backbone = timm.create_model(
+            backbone_name, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3)
+        )
+        encoder_channels = list(self.backbone.feature_info.channels()) # e.g., [96, 192, 384, 768]
+        
+        # Setup normalization and freeze logic from base class
+        cfg = getattr(self.backbone, "pretrained_cfg", None) or {}
+        self._setup_norm_freeze(cfg.get("mean", (0.485, 0.456, 0.406)),
+                                cfg.get("std", (0.229, 0.224, 0.225)), freeze)
+        
+        # 2. Setup the U-Net Decoder Blocks
+        # Top block handles Stride 32 -> Stride 16
+        self.dec1 = UNetDecoderBlock(encoder_channels[3], encoder_channels[2], decoder_dim * 4)
+        # Conv block handles Stride 16 -> Stride 8
+        self.dec2 = UNetDecoderBlock(decoder_dim * 4, encoder_channels[1], decoder_dim * 2)
+        # Conv block handles Stride 8 -> Stride 4
+        self.dec3 = UNetDecoderBlock(decoder_dim * 2, encoder_channels[0], decoder_dim)
+        
+        # Final upsampling stages to reach full resolution (Stride 2 and Stride 1)
+        # Since the backbone has no skip connections here, we pass skip=None
+        self.dec4 = UNetDecoderBlock(decoder_dim, 0, decoder_dim) # Stride 4 -> Stride 2
+        self.dec5 = UNetDecoderBlock(decoder_dim, 0, decoder_dim) # Stride 2 -> Stride 1
+
+        # Define the channels of the output pyramid that the denoiser will sample from.
+        # We output a multi-scale refined pyramid: [Stride 1, Stride 4, Stride 16]
+        self.feature_channels = [decoder_dim, decoder_dim, decoder_dim * 4]
+
+    def extract(self, image):
+        """Passes image through backbone encoder and U-Net decoder to get refined features."""
+        x = self._preprocess(image)
+        
+        # Forward pass through the backbone (Encoder)
+        if self.freeze:
+            with torch.no_grad():
+                feats = list(self.backbone(x))
+        else:
+            feats = list(self.backbone(x))
+            
+        # Extract individual scale maps from the encoder pyramid
+        skip_s4, skip_s8, skip_s16, skip_s32 = feats
+
+        # Backward pass through the U-Net Decoder using skip connections
+        s16_refined = self.dec1(skip_s32, skip_s16)
+        s8_refined = self.dec2(s16_refined, skip_s8)
+        s4_refined = self.dec3(s8_refined, skip_s4)
+        
+        # Upsample to full resolution without backbone skips
+        s2_refined = self.dec4(s4_refined, skip=None)
+        s1_refined = self.dec5(s2_refined, skip=None)
+
+        # Return a balanced multi-scale pyramid back to the point sampler
+        return [s1_refined, s4_refined, s16_refined]
+
+    def fuse(self, feats, t):
+        return feats
+
+    def forward(self, image, t):
+        return self.extract(image)
+
 
 def build_conditioner(cfg):
     if cfg.encoder == "convnext":
@@ -158,5 +248,12 @@ def build_conditioner(cfg):
             in_channels=cfg.in_channels, cond_dim=cfg.cond_channels,
             start_dim=cfg.unet_start_dim, dim_mults=cfg.unet_dim_mults,
             groups=cfg.unet_groupnorm_groups,
+        )
+    elif cfg.encoder == "convnext_unet":  # New option for the full U-Net architecture
+        return BackboneUNetConditioner(
+            backbone_name=cfg.backbone, 
+            pretrained=cfg.pretrained, 
+            freeze=cfg.freeze_backbone,
+            decoder_dim=cfg.cond_channels  # Uses your config's base channel dimension
         )
     raise ValueError(f"Unknown encoder '{cfg.encoder}' (expected 'convnext', 'pvt', or 'unet').")

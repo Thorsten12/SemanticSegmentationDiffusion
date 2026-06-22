@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 
 from ..utils.rasterize import soft_dice_loss
+# Added import for boundary attention
+from ..utils.helper_funcs import calc_boundary_att
 
 
 def _extract(a: torch.Tensor, t: torch.Tensor, x_shape) -> torch.Tensor:
@@ -31,54 +33,83 @@ class GaussianDiffusion:
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
 
     # --- forward process -----------------------------------------------------
-
     def q_sample(self, x0, t, noise=None):
         """Sample x_t ~ q(x_t | x0)."""
         if noise is None:
             noise = torch.randn_like(x0)
+            noise = torch.clamp(noise, -3.0, 3.0)  # clamp noise to stabilize training
         return (
             _extract(self.sqrt_alphas_cumprod, t, x0.shape) * x0
             + _extract(self.sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise
-        )
+        ), noise
 
+    def get_x0_from_noise(self, noise_pred, t, x_t):
+        """Compute predicted x0 from noise prediction."""
+        sqrt_a_bar = _extract(self.sqrt_alphas_cumprod, t, x_t.shape)
+        sqrt_one_minus_a_bar = _extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape)
+        return (x_t - sqrt_one_minus_a_bar * noise_pred) / sqrt_a_bar.clamp(min=1e-8)
+    
     # --- training loss -------------------------------------------------------
 
-    def training_losses(self, predicted_x0, x0, t, masks=None,
-                        lambda_uniformity=0.1, lambda_dice=1.0, snr_gamma=5.0):
-        """Per-sample min-SNR-weighted x0 MSE + uniformity + soft-Dice.
-
-        masks (optional, [B,1,H,W] in {0,1}) enables the differentiable soft-Dice
-        term, which gives the boundary points a geometry-aware (mask-level) signal
-        instead of relying solely on order-dependent coordinate MSE.
+    def training_losses(self, predicted_noise, noise, x_t, x0, t, masks=None,
+                    lambda_uniformity=0.1, lambda_dice=1.0, lambda_boundary=1.0,
+                    adaptive_uniformity=True):
+        """Noise MSE scaled by 100^2 + boundary loss + uniformity + soft-Dice via reconstructed x0.
+        
+        Args:
+            adaptive_uniformity (bool): If True, uses curvature-weighted relaxation in indents.
+                                       If False, enforces strict equidistant sampling globally (Baseline).
         """
-        # Per-sample min-SNR-gamma weighting (x0 parameterization). SNR = a_bar /
-        # (1 - a_bar); clamping at gamma stops low-noise steps from dominating, and
-        # -- unlike the old a_bar weighting -- high-noise steps keep real gradient.
-        a_bar = _extract(self.alphas_cumprod, t, x0.shape)            # [B,1,1]
-        snr = a_bar / (1.0 - a_bar).clamp(min=1e-8)
-        w = snr.clamp(max=snr_gamma)
-        w = w / w.mean().clamp(min=1e-8)                             # keep scale ~1
-        se = ((predicted_x0 - x0) ** 2).mean(dim=tuple(range(1, x0.ndim)),
-                                             keepdim=True)            # [B,1,1]
-        loss_x0 = (w * se).mean()
-
-        # Closed-contour uniformity: penalize variance of neighbor distances.
+        
+        # 1. Element-wise MSE for noise scaled by 100^2
+        loss_noise = F.mse_loss(predicted_noise, noise) * (100 ** 2)
+    
+        # 2. Boundary-weighted noise loss scaled by 100^2
+        boundary_att = calc_boundary_att(x0, t, T=self.timesteps, gamma=1.5)
+        loss_boundary = (boundary_att * (predicted_noise - noise) ** 2).mean() * (100 ** 2)
+    
+        # 3. Reconstruct predicted_x0 using the tutor's helper function
+        predicted_x0 = self.get_x0_from_noise(predicted_noise, t, x_t)
+    
+        # Compute distances between predicted adjacent points (needed for both modes)
         nxt = torch.roll(predicted_x0, shifts=-1, dims=1)
         dists = torch.norm(predicted_x0 - nxt, dim=-1)        # [B, N]
-        loss_uniformity = dists.std(dim=1).mean()
-
-        # Differentiable mask-level term (rasterize polygon -> soft-Dice).
+    
+        # 4. Conditional Uniformity Loss Calculation
+        if adaptive_uniformity:
+            # --- Curvature-adaptive uniformity loss ---
+            # Calculate curvature on the clean ground-truth points (x0)
+            prev_gt = torch.roll(x0, shifts=1, dims=1)
+            next_gt = torch.roll(x0, shifts=-1, dims=1)
+            gt_curvature = torch.norm(next_gt + prev_gt - 2 * x0, dim=-1)  # [B, N]
+    
+            # Map high curvature to low uniformity weights using negative exponential
+            uniformity_weights = torch.exp(-2.0 * gt_curvature)  # [B, N]
+    
+            # Calculate squared deviation from the mean distance per batch item
+            mean_dist = dists.mean(dim=1, keepdim=True)           # [B, 1]
+            squared_diffs = (dists - mean_dist) ** 2               # [B, N]
+    
+            # Apply weights: penalize variance only on flat segments, relax in indents
+            loss_uniformity = (squared_diffs * uniformity_weights).mean()
+        else:
+            # --- Classic strict uniform loss (Baseline) ---
+            # Calculates standard deviation of distances globally per sample
+            loss_uniformity = dists.std(dim=1).mean()
+    
+        # 5. Differentiable mask-level term (rasterize polygon -> soft-Dice).
         if masks is not None and lambda_dice > 0:
             loss_dice = soft_dice_loss(predicted_x0, masks)
         else:
             loss_dice = torch.zeros((), device=x0.device)
-
-        total = loss_x0 + lambda_uniformity * loss_uniformity + lambda_dice * loss_dice
-        return total, {"loss_x0": loss_x0.detach(),
+    
+        total = loss_noise + lambda_boundary * loss_boundary + lambda_uniformity * loss_uniformity + lambda_dice * loss_dice
+        return total, {"loss_noise": loss_noise.detach(),
+                       "loss_boundary": loss_boundary.detach(),
                        "loss_uniformity": loss_uniformity.detach(),
                        "loss_dice": loss_dice.detach()}
 
-    # --- sampling ------------------------------------------------------------
+        # --- sampling ------------------------------------------------------------
 
     @torch.no_grad()
     def ddim_sample(self, denoise_fn, cond_fn, shape, ddim_steps=50,
@@ -99,10 +130,12 @@ class GaussianDiffusion:
             t_b = torch.full((shape[0],), t, device=device, dtype=torch.long)
 
             cond_maps = cond_fn(t_b)
-            x0_cond = denoise_fn(x, t_b, cond_maps)
+            pred_noise = denoise_fn(x, t_b, cond_maps)
+            x0_cond = self.get_x0_from_noise(pred_noise, t_b, x)
             if guidance_scale != 1.0:
                 null_maps = [torch.zeros_like(m) for m in cond_maps]
-                x0_uncond = denoise_fn(x, t_b, null_maps)
+                pred_noise_uncond = denoise_fn(x, t_b, null_maps)
+                x0_uncond = self.get_x0_from_noise(pred_noise_uncond, t_b, x)
                 x0 = x0_uncond + guidance_scale * (x0_cond - x0_uncond)
             else:
                 x0 = x0_cond

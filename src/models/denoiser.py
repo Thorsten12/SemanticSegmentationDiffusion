@@ -112,6 +112,12 @@ class ContourDenoiser(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
+        self.curve_proj = nn.Sequential(
+            nn.Linear(1, hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, hidden_dim)
+        )
+
         # Fixed sinusoidal positional embedding over the ordered point index.
         pe = torch.zeros(1, n_points, hidden_dim)
         position = torch.arange(0, n_points, dtype=torch.float).unsqueeze(1)
@@ -134,26 +140,42 @@ class ContourDenoiser(nn.Module):
             nn.Linear(hidden_dim // 2, 2),
         )
 
+        self.temp1 = nn.Parameter(torch.ones(hidden_dim, 1)*1e-3)
+        self.temp2 = nn.Parameter(torch.ones(hidden_dim, 1)*1e-3)
+        
     def forward(self, points, t, cond_maps):
         """points [B,N,2], t [B], cond_maps = raw pyramid (list of [B,C,H,W]) -> x0 [B,N,2]."""
         t_vec = self.time_mlp(timestep_embedding(t, self.hidden_dim))   # [B,H]
         t_emb = t_vec.unsqueeze(1)                                      # [B,1,H]
 
         guidance = self.sampler(cond_maps, points, t_vec)              # [B,N,H]
-        coord_pe = self.coord_ff(points)                              # [B,N,coord_feat]
+        coord_pe = self.coord_ff(points)                               # [B,N,coord_feat]
 
-        # Positional info enters only here (additive), not entangled with content.
-        x = self.coord_mlp(coord_pe) + guidance + self.pos_emb + t_emb
+        # --- NEU: Compute curvature bias from current point coordinates ---
+        # Get immediate neighbors in the closed loop
+        prev_p = torch.roll(points, shifts=1, dims=1)
+        next_p = torch.roll(points, shifts=-1, dims=1)
+        
+        # Discrete Laplacian magnitude: ||x_{i-1} + x_{i+1} - 2x_i||
+        current_curve = torch.norm(next_p + prev_p - 2 * points, dim=-1, keepdim=True) # [B, N, 1]
+        
+        # Project to hidden dimension
+        curve_bias = self.curve_proj(current_curve)                    # [B, N, H]
 
+        # --- REVISED: Inject the curvature bias additively into the point features ---
+        x = self.coord_mlp(coord_pe) + guidance + self.pos_emb + t_emb + curve_bias
+
+        # The rest of your architecture remains completely global and untouched
         x = x.transpose(1, 2)
-        x = F.gelu(self.local_conv1(x))
+        x = x + self.temp1 * F.gelu(self.local_conv1(x))
         x = x.transpose(1, 2)
 
         x = self.transformer(x)
 
         x = x.transpose(1, 2)
-        x = F.gelu(self.local_conv2(x))
+        x = x + self.temp2 * F.gelu(self.local_conv2(x))
         x = x.transpose(1, 2)
 
         out = self.out_mlp(torch.cat([x, guidance, points], dim=-1))
+        out = torch.clamp(out, -3.0, 3.0)
         return out

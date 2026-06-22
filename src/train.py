@@ -21,6 +21,7 @@ from .data import build_contour_dataset, split_counts
 from .diffusion import GaussianDiffusion
 from .models import ContourDenoiser, build_conditioner
 from .utils import EMA
+from .utils.helper_funcs import enhance_frequencies, calc_boundary_att
 
 
 def build_models(cfg: Config, device):
@@ -47,7 +48,7 @@ def main():
     parser.add_argument("--batch_size", type=int)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--n_points", type=int)
-    parser.add_argument("--encoder", choices=["convnext", "pvt", "unet"])
+    parser.add_argument("--encoder", choices=["convnext", "convnext_unet", "pvt", "unet"])
     parser.add_argument("--backbone", type=str)
     parser.add_argument("--freeze_backbone", action="store_true", default=None,
                         help="freeze the pretrained backbone (train only fusion + denoiser)")
@@ -63,6 +64,10 @@ def main():
     parser.add_argument("--lambda_dice", type=float)
     parser.add_argument("--snr_gamma", type=float)
     parser.add_argument("--no_amp", action="store_true")
+    parser.add_argument("--no_adaptive_uniformity", action="store_false", dest="adaptive_uniformity", default=True,
+                        help="disable curvature-adaptive uniformity loss and use strict baseline std instead")
+    parser.add_argument("--pretrained_weights", type=str, default=None,
+                        help="Path to the checkpoint file (best.pth) from ISIC pretraining")
     args = parser.parse_args()
 
     cfg = Config.from_args(args)
@@ -80,10 +85,13 @@ def main():
     print(f"Dataset {cfg.dataset} | split -> train {counts['tr']} | "
           f"val {counts['vl']} | test {counts['te']}")
     train_ds = build_contour_dataset(cfg.skin_root, cfg.dataset, "tr", cfg.n_points,
-                                     cfg.img_size, augment=cfg.augment,
-                                     aug_level=cfg.aug_level, npy_size=cfg.npy_size)
+                                cfg.img_size, augment=cfg.augment,
+                                aug_level=cfg.aug_level, npy_size=cfg.npy_size,
+                                adaptive_sampling=getattr(cfg, "adaptive_uniformity", True)) 
+
     val_ds = build_contour_dataset(cfg.skin_root, cfg.dataset, "vl", cfg.n_points,
-                                   cfg.img_size, augment=False, npy_size=cfg.npy_size)
+                                cfg.img_size, augment=False, npy_size=cfg.npy_size,
+                                adaptive_sampling=getattr(cfg, "adaptive_uniformity", True)) 
     persist = cfg.num_workers > 0
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
                               num_workers=cfg.num_workers, drop_last=True, pin_memory=True,
@@ -93,6 +101,19 @@ def main():
 
     # ----- models / diffusion / optim -----
     encoder, denoiser = build_models(cfg, device)
+
+    if getattr(cfg, "pretrained_weights", None) is not None:
+        if os.path.exists(cfg.pretrained_weights):
+            print(f"\n[INFO] Loading pretrained weights from {cfg.pretrained_weights}...")
+            checkpoint = torch.load(cfg.pretrained_weights, map_location=device)
+            
+            # Load weights into encoder and denoiser
+            encoder.load_state_dict(checkpoint["encoder"])
+            denoiser.load_state_dict(checkpoint["denoiser"])
+            print("[INFO] -> Transfer Learning setup complete. Weights injected successfully.\n")
+        else:
+            raise FileNotFoundError(f"Could not find pretrained checkpoint at: {cfg.pretrained_weights}")
+
     diffusion = GaussianDiffusion(cfg.timesteps, cfg.beta_start, cfg.beta_end, device=device)
     ema = EMA([encoder, denoiser], decay=cfg.ema_decay)
 
@@ -138,20 +159,30 @@ def main():
             t = torch.randint(0, cfg.timesteps, (b,), device=device).long()
 
             with torch.amp.autocast("cuda", enabled=use_amp):
-                noisy = diffusion.q_sample(points, t)
-                raw = encoder.extract(images)              # backbone (once)
+                noisy, noise = diffusion.q_sample(points, t)
+                
+                # --- NEW: Enhance mid-range wavelengths globally ---
+                images = enhance_frequencies(images, mid_gain=getattr(cfg, "mid_frequency_gain", 1.5), edge_gain=getattr(cfg, "edge_frequency_gain", 1.2))
+                
+                raw = encoder.extract(images)               # backbone (once)
                 cond_maps = encoder.fuse(raw, t)           # time-conditioned fusion
                 # Classifier-free guidance: drop the condition per-sample (not
                 # per-batch), so the unconditional branch sees varied examples.
                 keep = (torch.rand(b, device=device) >= cfg.cfg_dropout)
                 keep = keep.to(cond_maps[0].dtype).view(b, 1, 1, 1)
                 cond_maps = [m * keep for m in cond_maps]
-                pred_x0 = denoiser(noisy, t, cond_maps)
-                pred_x0 = torch.clamp(pred_x0, -cfg.x0_clamp, cfg.x0_clamp)
+                
+                # Model predicts noise epsilon
+                pred_noise = denoiser(noisy, t, cond_maps)
+                
+                # Compute integrated losses (with optional curvature adaptation)
                 loss, parts = diffusion.training_losses(
-                    pred_x0, points, t, masks=masks,
+                    pred_noise, noise, noisy, points, t, masks=masks,
                     lambda_uniformity=cfg.lambda_uniformity,
-                    lambda_dice=cfg.lambda_dice, snr_gamma=cfg.snr_gamma)
+                    lambda_dice=cfg.lambda_dice,
+                    lambda_boundary=getattr(cfg, "lambda_boundary", 1.0),
+                    adaptive_uniformity=getattr(cfg, "adaptive_uniformity", True)  
+                )
 
             scaler.scale(loss).backward()
             if cfg.grad_clip:
@@ -163,7 +194,8 @@ def main():
 
             running += loss.item()
             pbar.set_postfix({"loss": f"{loss.item():.4f}",
-                              "x0": f"{parts['loss_x0'].item():.4f}",
+                              "noise": f"{parts['loss_noise'].item():.4f}",
+                              "bound": f"{parts['loss_boundary'].item():.4f}",
                               "dice": f"{parts['loss_dice'].item():.4f}",
                               "unif": f"{parts['loss_uniformity'].item():.4f}"})
 

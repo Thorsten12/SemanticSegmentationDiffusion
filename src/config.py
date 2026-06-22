@@ -14,7 +14,7 @@ class Config:
     # Datasets are read from preprocessed npy under <skin_root>/<DATASET>/np/ and
     # split by the published index ranges (see data/seg_datasets.py), so the
     # train/val/test partition matches the reference exactly.
-    skin_root: str = "/hdd/datasets/Skin"
+    skin_root: str = "/loctmp/sit28238/SemanticSegmentationDiffusion/data/datasets"
     dataset: str = "ph2"                          # ph2 | isic2017 | isic2018 | ham10000
     npy_size: int = 224                           # resolution of the stored npy arrays
     img_size: Tuple[int, int] = (224, 224)        # (H, W) fed to the model
@@ -38,6 +38,7 @@ class Config:
     pretrained: bool = True                      # load pretrained weights
     freeze_backbone: bool = False                # if True, train only fusion + denoiser
     backbone_lr: float = 1e-5                    # low LR for pretrained backbone when fine-tuning
+    pretrained_weights: str | None = None         # path to full P2SDiff checkpoint (encoder+denoiser) for transfer learning
 
     # PVT path ("pvt"): uses local models/pvtv2.py + pretrained_pth/pvt/*.pth
     pvt_variant: str = "pvt_v2_b2"

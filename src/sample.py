@@ -18,6 +18,8 @@ from .data import build_contour_dataset, split_counts
 from .diffusion import GaussianDiffusion
 from .models import ContourDenoiser, build_conditioner
 from .utils import dice_score, iou_score, points_to_mask, save_prediction_grid
+from .utils.helper_funcs import enhance_frequencies
+from .utils.post_processing import remove_contour_outliers, smooth_closed_contour, taubin_smooth_closed_contour
 
 
 @torch.no_grad()
@@ -29,6 +31,10 @@ def evaluate(encoder, denoiser, diffusion, loader, cfg, device, viz_path=None):
 
     for images, gt_points, gt_masks in loader:
         images = images.to(device)
+        
+        # --- NEW: Apply the exact same enhancement during sampling ---
+        images = enhance_frequencies(images, mid_gain=getattr(cfg, "mid_frequency_gain", 1.5), edge_gain=getattr(cfg, "edge_frequency_gain", 1.2))
+        
         raw = encoder.extract(images)                  # backbone runs once
         cond_fn = lambda t_b: encoder.fuse(raw, t_b)   # time-conditioned per step
         shape = (images.shape[0], cfg.n_points, 2)
@@ -36,6 +42,14 @@ def evaluate(encoder, denoiser, diffusion, loader, cfg, device, viz_path=None):
             denoiser, cond_fn, shape,
             ddim_steps=cfg.ddim_steps, guidance_scale=cfg.guidance_scale, clamp=1.0,
         )
+
+        pred_points = remove_contour_outliers(pred_points, threshold_sigma=2.0)
+
+        #pred_points = smooth_closed_contour(pred_points, kernel_size=3, sigma=1.0)
+
+        pred_points = taubin_smooth_closed_contour(pred_points, iterations=5, lamb=0.5, mu=-0.53)
+
+
 
         pred_masks_np, batch_scores = [], []
         for i in range(images.shape[0]):
@@ -107,7 +121,8 @@ def main():
 
     split = "vl" if args.split == "val" else "te"
     ds = build_contour_dataset(cfg.skin_root, cfg.dataset, split, cfg.n_points,
-                               cfg.img_size, augment=False, npy_size=cfg.npy_size)
+            cfg.img_size, augment=False, npy_size=cfg.npy_size,
+            adaptive_sampling=getattr(cfg, "adaptive_uniformity", True)) 
     loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False)
 
     encoder, denoiser = load_checkpoint(args.ckpt, cfg, device)
