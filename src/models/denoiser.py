@@ -151,7 +151,6 @@ class ContourDenoiser(nn.Module):
         guidance = self.sampler(cond_maps, points, t_vec)              # [B,N,H]
         coord_pe = self.coord_ff(points)                               # [B,N,coord_feat]
 
-        # --- NEU: Compute curvature bias from current point coordinates ---
         # Get immediate neighbors in the closed loop
         prev_p = torch.roll(points, shifts=1, dims=1)
         next_p = torch.roll(points, shifts=-1, dims=1)

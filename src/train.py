@@ -68,6 +68,8 @@ def main():
                         help="disable curvature-adaptive uniformity loss and use strict baseline std instead")
     parser.add_argument("--pretrained_weights", type=str, default=None,
                         help="Path to the checkpoint file (best.pth) from ISIC pretraining")
+    parser.add_argument("--mid_frequency_gain", type=float, default=1.5)
+    parser.add_argument("--edge_frequency_gain", type=float, default=1.2)
     args = parser.parse_args()
 
     cfg = Config.from_args(args)

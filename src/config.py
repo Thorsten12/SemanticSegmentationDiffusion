@@ -27,6 +27,12 @@ class Config:
     n_test: int = 40
     split_seed: int = 42
 
+    # ----- TTA and Augmentation Extensions -----
+    tta: bool = False                             # Enable Test-Time Augmentation (H-Flip & V-Flip) during sampling
+    mid_frequency_gain: float = 1.5               # Gain for mid-range frequencies in image enhancement
+    edge_frequency_gain: float = 1.2              # Gain for edge/high frequencies in image enhancement
+    adaptive_uniformity: bool = True              # True: adaptive curvature sampling | False: strict equidistant points
+
     # ----- model: conditioning encoder -----
     in_channels: int = 3                         # image-only conditioning (RGB)
     encoder: str = "convnext"                    # "convnext" | "pvt" | "unet"
