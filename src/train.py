@@ -40,7 +40,6 @@ def build_models(cfg: Config, device):
 
 def main():
     parser = argparse.ArgumentParser(description="Train P2SDiff on PH2")
-    # Only expose the knobs people tweak most; everything else lives in Config.
     parser.add_argument("--dataset", choices=["ph2", "isic2017", "isic2018", "ham10000"])
     parser.add_argument("--skin_root", type=str)
     parser.add_argument("--out_dir", type=str)
@@ -50,8 +49,7 @@ def main():
     parser.add_argument("--n_points", type=int)
     parser.add_argument("--encoder", choices=["convnext", "convnext_unet", "pvt", "unet"])
     parser.add_argument("--backbone", type=str)
-    parser.add_argument("--freeze_backbone", action="store_true", default=None,
-                        help="freeze the pretrained backbone (train only fusion + denoiser)")
+    parser.add_argument("--freeze_backbone", action="store_true", default=None)
     parser.add_argument("--backbone_lr", type=float)
     parser.add_argument("--coord_fourier_bands", type=int)
     parser.add_argument("--pos_grid_bands", type=int)
@@ -64,12 +62,20 @@ def main():
     parser.add_argument("--lambda_dice", type=float)
     parser.add_argument("--snr_gamma", type=float)
     parser.add_argument("--no_amp", action="store_true")
-    parser.add_argument("--no_adaptive_uniformity", action="store_false", dest="adaptive_uniformity", default=True,
-                        help="disable curvature-adaptive uniformity loss and use strict baseline std instead")
-    parser.add_argument("--pretrained_weights", type=str, default=None,
-                        help="Path to the checkpoint file (best.pth) from ISIC pretraining")
+    parser.add_argument("--no_adaptive_uniformity", action="store_false",
+                        dest="adaptive_uniformity", default=True)
+    parser.add_argument("--pretrained_weights", type=str, default=None)
     parser.add_argument("--mid_frequency_gain", type=float, default=1.5)
     parser.add_argument("--edge_frequency_gain", type=float, default=1.2)
+    # --- Uncertainty head ---
+    parser.add_argument("--lambda_uncertainty", type=float, default=None,
+                        help="Weight for the log-sigma regularization term in Kendall loss "
+                             "(default: cfg.lambda_uncertainty = 1.0). "
+                             "Higher = model penalized more for hedging uncertainty.")
+    parser.add_argument("--uncertainty_skip_threshold", type=float, default=None,
+                        help="DDIM skip threshold on sigma=exp(log_sigma). Points with "
+                             "sigma below this are frozen after first DDIM step. "
+                             "Good starting value: 0.3. Set 0 or omit to disable.")
     args = parser.parse_args()
 
     cfg = Config.from_args(args)
@@ -82,18 +88,17 @@ def main():
     with open(os.path.join(cfg.out_dir, "config.json"), "w") as f:
         json.dump({k: getattr(cfg, k) for k in cfg.__dataclass_fields__}, f, indent=2, default=str)
 
-    # ----- data (published index split, read from preprocessed npy) -----
+    # ----- data -----
     counts = split_counts(cfg.skin_root, cfg.dataset, cfg.npy_size)
     print(f"Dataset {cfg.dataset} | split -> train {counts['tr']} | "
           f"val {counts['vl']} | test {counts['te']}")
     train_ds = build_contour_dataset(cfg.skin_root, cfg.dataset, "tr", cfg.n_points,
                                 cfg.img_size, augment=cfg.augment,
                                 aug_level=cfg.aug_level, npy_size=cfg.npy_size,
-                                adaptive_sampling=getattr(cfg, "adaptive_uniformity", True)) 
-
+                                adaptive_sampling=getattr(cfg, "adaptive_uniformity", True))
     val_ds = build_contour_dataset(cfg.skin_root, cfg.dataset, "vl", cfg.n_points,
                                 cfg.img_size, augment=False, npy_size=cfg.npy_size,
-                                adaptive_sampling=getattr(cfg, "adaptive_uniformity", True)) 
+                                adaptive_sampling=getattr(cfg, "adaptive_uniformity", True))
     persist = cfg.num_workers > 0
     train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
                               num_workers=cfg.num_workers, drop_last=True, pin_memory=True,
@@ -108,19 +113,28 @@ def main():
         if os.path.exists(cfg.pretrained_weights):
             print(f"\n[INFO] Loading pretrained weights from {cfg.pretrained_weights}...")
             checkpoint = torch.load(cfg.pretrained_weights, map_location=device)
-            
-            # Load weights into encoder and denoiser
             encoder.load_state_dict(checkpoint["encoder"])
-            denoiser.load_state_dict(checkpoint["denoiser"])
-            print("[INFO] -> Transfer Learning setup complete. Weights injected successfully.\n")
+            # ---------------------------------------------------------------- #
+            # Uncertainty-head warm-start:                                      #
+            # The checkpoint was trained WITHOUT the uncertainty head.          #
+            # Load with strict=False so the new uncertainty_mlp weights are    #
+            # initialised from their zero-init (neutral sigma=1 start) and     #
+            # the rest of the denoiser is loaded from the pretrained run.      #
+            # ---------------------------------------------------------------- #
+            missing, unexpected = denoiser.load_state_dict(
+                checkpoint["denoiser"], strict=False
+            )
+            if missing:
+                print(f"[INFO] -> New parameters (uncertainty head): {missing}")
+            if unexpected:
+                print(f"[WARN] -> Unexpected keys in checkpoint: {unexpected}")
+            print("[INFO] -> Transfer Learning setup complete.\n")
         else:
             raise FileNotFoundError(f"Could not find pretrained checkpoint at: {cfg.pretrained_weights}")
 
     diffusion = GaussianDiffusion(cfg.timesteps, cfg.beta_start, cfg.beta_end, device=device)
     ema = EMA([encoder, denoiser], decay=cfg.ema_decay)
 
-    # Discriminative LR: a low LR for the pretrained backbone (when fine-tuning),
-    # the normal LR for the freshly-initialized fusion + denoiser.
     backbone = getattr(encoder, "backbone", None)
     backbone_ids = {id(p) for p in backbone.parameters()} if backbone is not None else set()
     backbone_params, head_params = [], []
@@ -139,7 +153,8 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     n_train = sum(p.numel() for p in trainable)
-    n_total = sum(p.numel() for p in encoder.parameters()) + sum(p.numel() for p in denoiser.parameters())
+    n_total = (sum(p.numel() for p in encoder.parameters())
+               + sum(p.numel() for p in denoiser.parameters()))
     bb_state = "frozen" if not backbone_params else f"fine-tune @ lr {cfg.backbone_lr:g}"
     print(f"Encoder: {cfg.encoder} (backbone {bb_state}) | trainable {n_train/1e6:.2f}M / "
           f"total {n_total/1e6:.2f}M | device {device} | amp {use_amp}")
@@ -154,7 +169,7 @@ def main():
         for images, points, masks in pbar:
             images = images.to(device, non_blocking=True)
             points = points.to(device, non_blocking=True)
-            masks = masks.to(device, non_blocking=True)
+            masks  = masks.to(device, non_blocking=True)
             b = images.shape[0]
 
             optimizer.zero_grad(set_to_none=True)
@@ -162,28 +177,39 @@ def main():
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 noisy, noise = diffusion.q_sample(points, t)
-                
-                # --- NEW: Enhance mid-range wavelengths globally ---
-                images = enhance_frequencies(images, mid_gain=getattr(cfg, "mid_frequency_gain", 1.5), edge_gain=getattr(cfg, "edge_frequency_gain", 1.2))
-                
-                raw = encoder.extract(images)               # backbone (once)
-                cond_maps = encoder.fuse(raw, t)           # time-conditioned fusion
-                # Classifier-free guidance: drop the condition per-sample (not
-                # per-batch), so the unconditional branch sees varied examples.
+
+                images = enhance_frequencies(
+                    images,
+                    mid_gain=getattr(cfg, "mid_frequency_gain", 1.5),
+                    edge_gain=getattr(cfg, "edge_frequency_gain", 1.2),
+                )
+
+                raw = encoder.extract(images)
+                cond_maps = encoder.fuse(raw, t)
+
                 keep = (torch.rand(b, device=device) >= cfg.cfg_dropout)
                 keep = keep.to(cond_maps[0].dtype).view(b, 1, 1, 1)
                 cond_maps = [m * keep for m in cond_maps]
-                
-                # Model predicts noise epsilon
-                pred_noise = denoiser(noisy, t, cond_maps)
-                
-                # Compute integrated losses (with optional curvature adaptation)
+
+                # ------------------------------------------------------------ #
+                # Denoiser output: (pred_noise [B,N,2], log_sigma [B,N])        #
+                # ------------------------------------------------------------ #
+                denoiser_out = denoiser(noisy, t, cond_maps)
+                if isinstance(denoiser_out, tuple):
+                    pred_noise, log_sigma = denoiser_out
+                else:
+                    # Legacy fallback (no uncertainty head)
+                    pred_noise, log_sigma = denoiser_out, None
+
                 loss, parts = diffusion.training_losses(
-                    pred_noise, noise, noisy, points, t, masks=masks,
+                    pred_noise, noise, noisy, points, t,
+                    masks=masks,
+                    log_sigma=log_sigma,
                     lambda_uniformity=cfg.lambda_uniformity,
                     lambda_dice=cfg.lambda_dice,
                     lambda_boundary=getattr(cfg, "lambda_boundary", 1.0),
-                    adaptive_uniformity=getattr(cfg, "adaptive_uniformity", True)  
+                    lambda_uncertainty=getattr(cfg, "lambda_uncertainty", 1.0),
+                    adaptive_uniformity=getattr(cfg, "adaptive_uniformity", True),
                 )
 
             scaler.scale(loss).backward()
@@ -195,24 +221,31 @@ def main():
             ema.update([encoder, denoiser])
 
             running += loss.item()
-            pbar.set_postfix({"loss": f"{loss.item():.4f}",
-                              "noise": f"{parts['loss_noise'].item():.4f}",
-                              "bound": f"{parts['loss_boundary'].item():.4f}",
-                              "dice": f"{parts['loss_dice'].item():.4f}",
-                              "unif": f"{parts['loss_uniformity'].item():.4f}"})
+            postfix = {
+                "loss": f"{loss.item():.4f}",
+                "noise": f"{parts['loss_noise'].item():.4f}",
+                "bound": f"{parts['loss_boundary'].item():.4f}",
+                "dice":  f"{parts['loss_dice'].item():.4f}",
+                "unif":  f"{parts['loss_uniformity'].item():.4f}",
+            }
+            # Log mean sigma for monitoring uncertainty calibration
+            if log_sigma is not None:
+                postfix["σ̄"] = f"{log_sigma.exp().mean().item():.3f}"
+            pbar.set_postfix(postfix)
 
         avg = running / max(1, len(train_loader))
         history["epoch"].append(epoch + 1)
         history["loss"].append(avg)
         print(f"Epoch {epoch+1} | train loss {avg:.4f}")
 
-        # ----- periodic validation with EMA weights -----
         do_eval = (epoch + 1) % cfg.eval_every == 0 or (epoch + 1) == cfg.epochs
         if do_eval:
-            from .sample import evaluate  # local import avoids a cycle at module load
+            from .sample import evaluate
             ema_encoder, ema_denoiser = ema.modules
-            dice, iou = evaluate(ema_encoder, ema_denoiser, diffusion, val_loader, cfg, device,
-                                 viz_path=os.path.join(cfg.out_dir, f"val_epoch{epoch+1}.png"))
+            dice, iou = evaluate(
+                ema_encoder, ema_denoiser, diffusion, val_loader, cfg, device,
+                viz_path=os.path.join(cfg.out_dir, f"val_epoch{epoch+1}.png"),
+            )
             history["val_epoch"].append(epoch + 1)
             history["val_dice"].append(dice)
             history["val_iou"].append(iou)
@@ -229,7 +262,6 @@ def main():
                 }, os.path.join(cfg.out_dir, "best.pth"))
                 print(f"  -> new best (Dice {dice:.4f}) -> best.pth")
 
-        # Always keep the latest EMA checkpoint.
         ema_encoder, ema_denoiser = ema.modules
         torch.save({"encoder": ema_encoder.state_dict(), "denoiser": ema_denoiser.state_dict(),
                     "epoch": epoch + 1}, os.path.join(cfg.out_dir, "last.pth"))
