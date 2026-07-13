@@ -91,6 +91,9 @@ def main():
     parser.add_argument("--init_checkpoint", type=str, default=None)
     parser.add_argument("--init_from_ema", type=str2bool, default=True)
 
+    # --- MECA ---
+    parser.add_argument("--use_meca", type=str2bool, default=True)
+
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -169,9 +172,15 @@ def main():
     else:
         sigma_params = []
 
+    # --- Trainierbare Parameter ---
+    # Bei freeze=True bleibt das Backbone selbst eingefroren, aber MECA (Channel Attention)
+    # und die Fusion (_PerPointFusion, Zeit-Gewichtung der Skalenstufen) sollen weiterhin
+    # trainiert werden -- beide sind eigene, kleine Zusatzmodule, keine Backbone-Gewichte.
     if args.freeze:
         encoder.eval()
-        trainable_params = list(denoiser.parameters()) + sigma_params
+        meca_params = list(encoder.mecas.parameters()) if encoder.mecas is not None else []
+        fusion_params = list(encoder.fusion.parameters())
+        trainable_params = list(denoiser.parameters()) + meca_params + fusion_params + sigma_params
     else:
         trainable_params = (
             list(encoder.parameters()) + list(denoiser.parameters()) + sigma_params
@@ -179,11 +188,16 @@ def main():
 
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
     num_trainable = sum(p.numel() for p in trainable_params if p.requires_grad)
+
     print(f"Denoiser Parameter: {count_params(denoiser.parameters()):,}")
     if not args.freeze:
         print(f"Encoder Parameter: {count_params(encoder.parameters()):,}")
-    print(f"Sigma Parameter: {count_params(sigma_params):,}")
-    print(f"Gesamt trainierbar: {num_trainable:,}")
+    else:
+        if encoder.mecas is not None:
+            print(f"MECA Parameter: {count_params(meca_params):,}")
+        else:
+            print("MECA: deaktiviert")
+        print(f"Fusion Parameter: {count_params(fusion_params):,}")
 
     use_cuda_timing = device.type == "cuda"
 
@@ -219,9 +233,13 @@ def main():
             b_size = images.shape[0]
             t = torch.randint(0, args.timesteps, (b_size,), device=device).long()
 
-            with torch.set_grad_enabled(not args.freeze):
-                feats = encoder.extract(images)
-                cond = encoder.fuse(feats, t)
+            # extract() schützt das Backbone bereits intern per no_grad() (self.freeze),
+            # MECA läuft dort bewusst AUSSERHALB von no_grad() -> bleibt trainierbar.
+            # fuse() (=_PerPointFusion) soll ebenfalls immer trainierbar sein.
+            # Kein äußeres set_grad_enabled(not args.freeze) mehr -- das hätte MECA
+            # und die Fusion mit-eingefroren, obwohl sie im Optimizer stehen.
+            feats = encoder.extract(images)
+            cond = encoder.fuse(feats, t)
 
             noise = torch.randn_like(points)
             noise = torch.clamp(noise, -3.0, 3.0)
