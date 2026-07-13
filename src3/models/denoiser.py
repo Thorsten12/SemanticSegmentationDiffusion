@@ -78,7 +78,7 @@ class ContourDenoiser(nn.Module):
         
         self.local_conv2 = nn.Conv1d(hidden_dim, hidden_dim, 3, padding=1, padding_mode="circular")    
 
-        self.temp = nn.Parameter(torch.ones(fused_dim, 1) * 1e-3)
+        self.temp = nn.Parameter(torch.ones(fused_dim, 1) * 1e-3) # TODO als MLP für jeden Punkt? Richutung BISFs?
 
         self.out_mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim), 

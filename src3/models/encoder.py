@@ -4,6 +4,7 @@ import torch.nn as nn
 
 from ..utils import timestep_encoding
 from .LastVit import LastVit
+from .DinoV3 import DinoV3
 
 class _PerPointFusion(nn.Module):
     """
@@ -90,12 +91,16 @@ class ConvNextConditioner(_Backbones):
 class LastVitConditioner(_Backbones):
     def __init__(
         self,
-        ckpt_path: str = "/loctmp/sit28238/SemanticSegmentationDiffusion/pretrained/ViT_190k.pth",
-        layers: list = [3, 6, 9, 12],
+        ckpt_path: str = "...",
+        layers: list | None = None,
         freeze: bool = True,
         use_layer_norms: bool = True,
     ):
         super().__init__()
+        if layers is None:
+            layers = [2, 5, 7, 11]
+
+        
 
         self.backbone = LastVit(
             ckpt_path=ckpt_path,
@@ -116,18 +121,62 @@ class LastVitConditioner(_Backbones):
             for p in self.backbone.layer_norms.parameters():
                 p.requires_grad = True
 
+class DinoV3Conditioner(_Backbones):
+    def __init__(
+        self,
+        weights_path: str,
+        model_name: str = "dinov3_vits16",
+        layers: list | None = None,
+        freeze: bool = True,
+        use_layer_norms: bool = True,
+    ):
+        super().__init__()
+        if layers is None:
+            layers = [2, 5, 8, 11]
+
+        self.backbone = DinoV3(
+            weights_path=weights_path,
+            model_name=model_name,
+            layers=layers,
+            freeze=freeze,
+            use_layer_norms=use_layer_norms,
+        )
+
+        self.feature_channels = [self.backbone.hidden_dim for _ in layers]
+
+        self._setup_norm_freeze(
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+            freeze=freeze,
+        )
+
+        if freeze and use_layer_norms:
+            for p in self.backbone.layer_norms.parameters():
+                p.requires_grad = True
+
+DEFAULT_DINO_WEIGHTS = {
+    "dinov3_vits16": "/loctmp/sit28238/SemanticSegmentationDiffusion/pretrained/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+    "dinov3_vitb16": "/loctmp/sit28238/SemanticSegmentationDiffusion/pretrained/dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth",
+    "dinov3_vitl16": "/loctmp/sit28238/SemanticSegmentationDiffusion/pretrained/dinov3_vitl16_pretrain_lvd1689m-8aa4cbdd.pth",
+}
+
 
 def build_conditioner(cfg):
     if cfg.encoder == "convnext":
-        return ConvNextConditioner(
-            freeze=cfg.freeze
-        )
+        return ConvNextConditioner(freeze=cfg.freeze)
     if cfg.encoder == "lastVit":
-        return LastVitConditioner(  
+        return LastVitConditioner(
             ckpt_path=getattr(cfg, "ckpt_path", "/loctmp/sit28238/SemanticSegmentationDiffusion/pretrained/ViT_190k.pth"),
-            layers=getattr(cfg, "layers", [1,2,3,4,5,6,7,8,9,10,11,12]),  
-            freeze=cfg.freeze
+            layers=getattr(cfg, "layers", [2, 5, 7, 11]),
+            freeze=cfg.freeze,
+        )
+    if cfg.encoder == "dinov3":
+        model_name = getattr(cfg, "dino_model_name", "dinov3_vits16")
+        print(model_name, "geladen")
+        return DinoV3Conditioner(
+            weights_path=getattr(cfg, "dino_weights_path", DEFAULT_DINO_WEIGHTS[model_name]),
+            model_name=model_name,
+            layers=getattr(cfg, "layers", [2, 5, 8, 11]),
+            freeze=cfg.freeze,
         )
     raise ValueError(f"Unknown encoder type: {cfg.encoder}")
-
-

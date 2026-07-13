@@ -16,6 +16,7 @@ from .data import ArrayContourDataset
 from .diffusion import GaussianDiffusion
 
 from .visualisation import visualize_predictions, evaluate_dice
+from .data_split import make_splits
 
 def build_models(args):
     encoder = build_conditioner(cfg=args)
@@ -77,6 +78,19 @@ def main():
     parser.add_argument("--lamda_dice_max", type=float, default=5.0)
     parser.add_argument("--use_uncertainty_weighting", type=str2bool, default=True)
 
+    # --- LastVit/DinoV3 ---
+    parser.add_argument("--layers", type=int, nargs="+", default=[2, 5, 7, 11])
+    parser.add_argument("--dino_model_name", type=str, default="dinov3_vits16")
+
+    # --- Data ---
+    parser.add_argument("--random_state", type=int, default=42)
+    parser.add_argument("--val_size", type=float, default=0.2)
+    parser.add_argument("--test_size", type=float, default=0.2)
+
+    # --- FineTunen ---
+    parser.add_argument("--init_checkpoint", type=str, default=None)
+    parser.add_argument("--init_from_ema", type=str2bool, default=True)
+
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -94,8 +108,11 @@ def main():
     X_full = np.load(X_path)
     Y_full = np.load(Y_path)
 
-    X_train, X_val, Y_train, Y_val = train_test_split(
-        X_full, Y_full, test_size=0.2, random_state=42
+    (X_train, Y_train), (X_val, Y_val), (X_test, Y_test) = make_splits(
+        X_full, Y_full,
+        random_state=args.random_state,
+        val_size=args.val_size,
+        test_size=args.test_size,
     )
 
     train_dataset = ArrayContourDataset(
@@ -116,12 +133,24 @@ def main():
     encoder.to(device)
     denoiser.to(device)
 
+    if args.init_checkpoint is not None:
+        ckpt = torch.load(args.init_checkpoint, map_location=device)
+        if args.init_from_ema:
+            ema_sd = ckpt["ema_state_dict"]
+            weights = {k.replace("ema_model.", ""): v for k, v in ema_sd.items()
+                       if k.startswith("ema_model.")}
+        else:
+            weights = ckpt["denoiser_state_dict"]
+        missing, unexpected = denoiser.load_state_dict(weights, strict=False)
+        print(f"[Finetune-Init] Denoiser-Gewichte geladen aus {args.init_checkpoint} "
+              f"| missing={len(missing)} unexpected={len(unexpected)}")
+
     # --- EMA-Wrapper um den Denoiser ---
     # ema.ema_model ist die geglättete Kopie, die für Visualisierung/Inference genutzt wird.
     ema = EMA(
         denoiser,
         beta=args.ema_beta,
-        update_after_step=args.ema_update_after_step,
+        update_after_step=0 if args.init_checkpoint is not None else args.ema_update_after_step,
         update_every=args.ema_update_every,
     ).to(device)
 
