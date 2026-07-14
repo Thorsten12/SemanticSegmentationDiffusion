@@ -86,6 +86,8 @@ def main():
     parser.add_argument("--random_state", type=int, default=42)
     parser.add_argument("--val_size", type=float, default=0.2)
     parser.add_argument("--test_size", type=float, default=0.2)
+    parser.add_argument("--aug_level", type=str, default="strong")
+    parser.add_argument("--epoch_multiplier", type=int, default=1)
 
     # --- FineTunen ---
     parser.add_argument("--init_checkpoint", type=str, default=None)
@@ -119,10 +121,12 @@ def main():
     )
 
     train_dataset = ArrayContourDataset(
-        images=X_train, masks=Y_train, n_points=args.n_points, img_size=(224, 224)
+        images=X_train, masks=Y_train, n_points=args.n_points, img_size=(224, 224), 
+        aug_level = args.aug_level, augment=True, epoch_multiplier=args.epoch_multiplier
     )
     val_dataset = ArrayContourDataset(
-        images=X_val, masks=Y_val, n_points=args.n_points, img_size=(224, 224)
+        images=X_val, masks=Y_val, n_points=args.n_points, img_size=(224, 224), 
+        augment=False
     )
 
     train_loader = DataLoader(
@@ -340,6 +344,7 @@ def main():
             checkpoint_payload = {
                 "epoch": epoch + 1,
                 "denoiser_state_dict": denoiser.state_dict(),
+                "encoder_state_dict": encoder.state_dict(),   # NEU: MECA + Fusion mitspeichern
                 "ema_state_dict": ema.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
             }

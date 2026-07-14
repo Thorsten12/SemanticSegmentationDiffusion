@@ -207,7 +207,11 @@ def main():
     denoiser.to(device)
 
     ckpt = torch.load(args.checkpoint, map_location=device)
-
+    if "encoder_state_dict" in ckpt:
+        missing_enc, unexpected_enc = encoder.load_state_dict(ckpt["encoder_state_dict"], strict=False)
+        print(f"[Encoder] geladen | missing={len(missing_enc)} unexpected={len(unexpected_enc)}")
+    else:
+        print("[WARNUNG] Kein encoder_state_dict im Checkpoint — MECA/Fusion sind UNTRAINIERT!")
     if args.use_ema:
         # ema_state_dict enthält sowohl das Online- als auch das EMA-Modell (ema-pytorch Format).
         # Wir laden nur die EMA-Gewichte in unseren "nackten" denoiser.
@@ -259,7 +263,8 @@ def main():
           f"(random_state={random_state}, val_size={val_size}, test_size={test_size})")
 
     dataset = ArrayContourDataset(
-        images=X, masks=Y, n_points=model_args.n_points, img_size=(224, 224)
+        images=X, masks=Y, n_points=model_args.n_points, img_size=(224, 224),
+        augment=False,   # WICHTIG: Val/Test-Auswertung ohne Augmentierung, exakt wie in train.py
     )
 
     diffusion = GaussianDiffusion(
