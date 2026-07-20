@@ -44,7 +44,8 @@ class GaussianDiffusion:
     # --- training loss -------------------------------------------------------
 
     def training_losses(self, predicted_x0, x0, t, masks=None,
-                        lambda_uniformity=0.1, lambda_dice=1.0, snr_gamma=5.0):
+                        lambda_uniformity=0.1, lambda_dice=1.0, snr_gamma=5.0,
+                        soft_dice_size=64):
         """Per-sample min-SNR-weighted x0 MSE + uniformity + soft-Dice.
 
         masks (optional, [B,1,H,W] in {0,1}) enables the differentiable soft-Dice
@@ -69,7 +70,7 @@ class GaussianDiffusion:
 
         # Differentiable mask-level term (rasterize polygon -> soft-Dice).
         if masks is not None and lambda_dice > 0:
-            loss_dice = soft_dice_loss(predicted_x0, masks)
+            loss_dice = soft_dice_loss(predicted_x0, masks, size=soft_dice_size)
         else:
             loss_dice = torch.zeros((), device=x0.device)
 

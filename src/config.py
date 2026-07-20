@@ -75,6 +75,7 @@ class Config:
     # ----- loss -----
     lambda_uniformity: float = 0.1              # weight of neighbor-spacing regularizer
     lambda_dice: float = 1.0                    # weight of differentiable soft-Dice (mask-level)
+    soft_dice_size: int = 64                    # soft-raster resolution (higher = sharper boundary grad)
     snr_gamma: float = 5.0                      # min-SNR-gamma cap for per-sample x0 weighting
 
     # ----- optimization -----
@@ -86,6 +87,12 @@ class Config:
     amp: bool = True
     num_workers: int = 4
     grad_clip: float = 1.0
+    scheduler: str = "cosine"                    # "none" | "cosine"
+    warmup_epochs: int = 5
+    min_lr: float = 1e-6
+    # Warm-start from a previous EMA checkpoint (transfer learning).
+    init_checkpoint: str = ""
+    init_from_ema: bool = True                   # unused alias; checkpoint already stores EMA weights
 
     # ----- bookkeeping -----
     out_dir: str = "src/runs/baseline"
