@@ -15,8 +15,16 @@ Conditioning (the key design):
 Sequence model (closed ordered contour of N points):
   sinusoidal timestep embedding + fixed positional embedding over point index;
   circular Conv1d (the contour wraps around) -> Transformer encoder -> Conv1d;
-  MLP head -> 2D coordinate prediction. Coordinates enter only via an additive
-  Fourier path (kept OUT of the content fusion to avoid memorizing tiny datasets).
+  MLP head -> 2D coordinate prediction + per-point log-uncertainty.
+  Coordinates enter only via an additive Fourier path (kept OUT of the content
+  fusion to avoid memorizing tiny datasets).
+
+Uncertainty head:
+  An additional lightweight MLP branch predicts log_sigma per point
+  (log of aleatoric uncertainty). This enables:
+    - Kendall & Gal heteroscedastic loss weighting during training
+    - Adaptive DDIM step-skipping: points with low uncertainty (sigma < threshold)
+      are frozen in place, avoiding redundant denoising of already-confident points.
 """
 
 import math
@@ -112,6 +120,12 @@ class ContourDenoiser(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
+        self.curve_proj = nn.Sequential(
+            nn.Linear(1, hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, hidden_dim)
+        )
+
         # Fixed sinusoidal positional embedding over the ordered point index.
         pe = torch.zeros(1, n_points, hidden_dim)
         position = torch.arange(0, n_points, dtype=torch.float).unsqueeze(1)
@@ -128,32 +142,83 @@ class ContourDenoiser(nn.Module):
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.local_conv2 = nn.Conv1d(hidden_dim, hidden_dim, 3, padding=1, padding_mode="circular")
 
-        # Prediction head (skip-connected with guidance and raw coords).
+        # Primary noise-prediction head (skip-connected with guidance and raw coords).
         self.out_mlp = nn.Sequential(
             nn.Linear(hidden_dim + hidden_dim + 2, hidden_dim // 2), nn.GELU(),
             nn.Linear(hidden_dim // 2, 2),
         )
 
+        # ------------------------------------------------------------------ #
+        # Uncertainty head: predicts log_sigma per point.                     #
+        #                                                                      #
+        # Separate lightweight branch from shared transformer features.        #
+        # We use log_sigma (not sigma) for numerical stability – no clamping  #
+        # needed and the Kendall loss (1/sigma^2 * L + log sigma) is well-    #
+        # behaved across the full real line.                                   #
+        #                                                                      #
+        # Initialized near zero so exp(log_sigma) ≈ 1.0 at the start of     #
+        # training (neutral weighting, no sudden loss spikes).                 #
+        # ------------------------------------------------------------------ #
+        self.uncertainty_mlp = nn.Sequential(
+            nn.Linear(hidden_dim + hidden_dim + 2, hidden_dim // 4),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 4, 1),   # -> [B, N, 1]
+        )
+        # Init last layer near zero → exp(0) = 1 → neutral start
+        nn.init.zeros_(self.uncertainty_mlp[-1].weight)
+        nn.init.zeros_(self.uncertainty_mlp[-1].bias)
+
+        self.temp1 = nn.Parameter(torch.ones(hidden_dim, 1)*1e-3)
+        self.temp2 = nn.Parameter(torch.ones(hidden_dim, 1)*1e-3)
+        
     def forward(self, points, t, cond_maps):
-        """points [B,N,2], t [B], cond_maps = raw pyramid (list of [B,C,H,W]) -> x0 [B,N,2]."""
+        """points [B,N,2], t [B], cond_maps = raw pyramid (list of [B,C,H,W])
+
+        Returns:
+            pred_noise  [B, N, 2]   – predicted epsilon (noise)
+            log_sigma   [B, N]      – per-point log aleatoric uncertainty
+        """
         t_vec = self.time_mlp(timestep_embedding(t, self.hidden_dim))   # [B,H]
         t_emb = t_vec.unsqueeze(1)                                      # [B,1,H]
 
         guidance = self.sampler(cond_maps, points, t_vec)              # [B,N,H]
-        coord_pe = self.coord_ff(points)                              # [B,N,coord_feat]
+        coord_pe = self.coord_ff(points)                               # [B,N,coord_feat]
 
-        # Positional info enters only here (additive), not entangled with content.
-        x = self.coord_mlp(coord_pe) + guidance + self.pos_emb + t_emb
+        # Get immediate neighbors in the closed loop
+        prev_p = torch.roll(points, shifts=1, dims=1)
+        next_p = torch.roll(points, shifts=-1, dims=1)
+        
+        # Discrete Laplacian magnitude: ||x_{i-1} + x_{i+1} - 2x_i||
+        current_curve = torch.norm(next_p + prev_p - 2 * points, dim=-1, keepdim=True) # [B, N, 1]
+        
+        # Project to hidden dimension
+        curve_bias = self.curve_proj(current_curve)                    # [B, N, H]
+
+        # Inject the curvature bias additively into the point features
+        x = self.coord_mlp(coord_pe) + guidance + self.pos_emb + t_emb + curve_bias
 
         x = x.transpose(1, 2)
-        x = F.gelu(self.local_conv1(x))
+        x = x + self.temp1 * F.gelu(self.local_conv1(x))
         x = x.transpose(1, 2)
 
         x = self.transformer(x)
 
         x = x.transpose(1, 2)
-        x = F.gelu(self.local_conv2(x))
-        x = x.transpose(1, 2)
+        x = x + self.temp2 * F.gelu(self.local_conv2(x))
+        x = x.transpose(1, 2)                                         # [B, N, H]
 
-        out = self.out_mlp(torch.cat([x, guidance, points], dim=-1))
-        return out
+        # Shared skip-connection input for both heads
+        skip = torch.cat([x, guidance, points], dim=-1)               # [B, N, H+H+2]
+
+        # --- Primary head: noise prediction ---
+        pred_noise = self.out_mlp(skip)
+        pred_noise = torch.clamp(pred_noise, -3.0, 3.0)               # [B, N, 2]
+
+        # --- Uncertainty head: log_sigma per point ---
+        # Clamped to [-5, 3] → sigma in [~0.007, ~20], prevents degenerate solutions
+        # where the model collapses to infinite uncertainty to zero-out the loss.
+        #log_sigma = self.uncertainty_mlp(skip).squeeze(-1)            # [B, N]
+        log_sigma = self.uncertainty_mlp(skip.detach()).squeeze(-1)
+        log_sigma = torch.clamp(log_sigma, -5.0, 3.0)
+
+        return pred_noise, log_sigma

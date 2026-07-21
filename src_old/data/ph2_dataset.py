@@ -49,6 +49,61 @@ def uniform_sampling(contour: np.ndarray, n: int) -> np.ndarray:
     local_t = (t - s[idx]) / seg_len[idx]
     return contour[idx] + seg[idx] * local_t[:, None]
 
+def curvature_adaptive_sampling(contour: np.ndarray, n: int, alpha: float = 2.0) -> np.ndarray:
+    """Resample a closed polygon to `n` points, clustering more points in high-curvature areas.
+    
+    Args:
+        contour (np.ndarray): Input points [M, 2]
+        n (int): Target number of points (e.g., 200)
+        alpha (float): Controls adaptation strength. 
+                       0.0 = completely uniform. 
+                       Higher values = more points clustered in sharp bends/indents.
+    """
+    contour = np.asarray(contour, dtype=np.float32)
+    if not np.allclose(contour[0], contour[-1]):
+        contour = np.vstack([contour, contour[0]])
+
+    # 1. Compute segment vectors and their structural lengths
+    seg = np.diff(contour, axis=0)
+    seg_len = np.linalg.norm(seg, axis=1)
+    seg_len = np.maximum(seg_len, 1e-8)
+    
+    # Real physical arc length
+    s_physical = np.concatenate([[0.0], np.cumsum(seg_len)])
+
+    # 2. Compute curvature (angle changes between consecutive segments)
+    # Normalize segments to compute dot products for angles
+    seg_norm = seg / seg_len[:, None]
+    # Roll to get adjacent segments
+    seg_norm_next = np.roll(seg_norm, shift=-1, axis=0)
+    
+    # Cosine of angles between segment i and segment i+1
+    cos_angles = np.sum(seg_norm * seg_norm_next, axis=1)
+    cos_angles = np.clip(cos_angles, -1.0, 1.0)
+    angles = np.arccos(cos_angles) # Bending angle in radians at each vertex
+
+    # 3. Define a density weight per segment
+    # Weight = linear length + alpha * local bending intensity
+    # We distribute the vertex angle across its adjacent segments
+    vertex_curvature = angles
+    seg_curvature = 0.5 * (vertex_curvature + np.roll(vertex_curvature, shift=1))
+    
+    # Dense sampling metric
+    seg_weights = seg_len + alpha * seg_curvature
+    s_density = np.concatenate([[0.0], np.cumsum(seg_weights)])
+
+    # 4. Generate target positions in the warped density space
+    t_density = np.linspace(0.0, s_density[-1], n, endpoint=False)
+
+    # 5. Map warped density positions back to physical arc lengths via interpolation
+    t_physical = np.interp(t_density, s_density, s_physical)
+
+    # 6. Standard projection back to 2D coordinates (identical to original pipeline)
+    idx = np.searchsorted(s_physical, t_physical, side="right") - 1
+    idx = np.clip(idx, 0, len(seg) - 1)
+
+    local_t = (t_physical - s_physical[idx]) / seg_len[idx]
+    return contour[idx] + seg[idx] * local_t[:, None]
 
 def _list_pairs(root: str) -> List[dict]:
     """Discover (image, mask) path pairs from the flat trainx/trainy layout."""
@@ -93,12 +148,15 @@ class PH2ContourDataset(Dataset):
         img_size: Tuple[int, int] = (256, 256),
         augment: bool = False,
         aug_level: str = "strong",   # "none" | "light" | "strong"
+        adaptive_sampling: bool = True
     ):
         self.samples = samples
         self.n_points = n_points
         self.img_size = img_size  # (H, W)
         self.augment = augment and aug_level != "none"
         self.aug_level = aug_level
+
+        self.adaptive_sampling = adaptive_sampling
 
         self.img_transform = transforms.Compose([
             transforms.Resize(img_size),
@@ -152,24 +210,19 @@ class PH2ContourDataset(Dataset):
             or mask_binary.sum() == 0
         )
 
-    def _contour_points(self, mask_binary: np.ndarray):
-        """Largest external contour -> N uniformly spaced points, rolled to top.
-
-        Returns None if the mask has no usable external contour (rare empty /
-        degenerate HAM labels). Caller should skip or fall back.
-        """
+    def _contour_points(self, mask_binary: np.ndarray) -> np.ndarray:
+        """Largest external contour -> N points, rolled to top."""
         contours, _ = cv2.findContours(
             mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
         )
-        if not contours:
-            return None
-        contour = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(contour) < 1.0:
-            return None
-        contour = contour.squeeze()
-        if contour.ndim != 2 or contour.shape[0] < 3:
-            return None
-        points = uniform_sampling(contour, self.n_points)
+        contour = max(contours, key=cv2.contourArea).squeeze()
+        
+        # --- NEU: Dynamische Weiche je nach Konfiguration ---
+        if self.adaptive_sampling:
+            points = curvature_adaptive_sampling(contour, self.n_points, alpha=2.0)
+        else:
+            points = uniform_sampling(contour, self.n_points)
+            
         top_idx = int(np.argmin(points[:, 1]))      # topmost point -> canonical start
         return np.roll(points, shift=-top_idx, axis=0)
 
@@ -183,49 +236,43 @@ class PH2ContourDataset(Dataset):
         return img, mask
 
     def __getitem__(self, idx: int):
-        # A few HAM masks are empty; remap to another sample instead of crashing.
-        for _ in range(8):
-            img, mask = self._load_raw(idx)
+        img, mask = self._load_raw(idx)
 
-            img_used, mask_used = img, mask  # default: no augmentation
-            if self.augment:
-                # Keep the first augmentation that leaves the whole lesion inside the
-                # frame. "light" tries once (else identity, the original recipe);
-                # "strong" retries so almost every sample is augmented.
-                attempts = 5 if self.aug_level == "strong" else 1
-                for _ in range(attempts):
-                    aug_img, aug_mask = self._augment(img, mask)
-                    aug_mask_r = TF.resize(
-                        aug_mask, self.img_size,
-                        interpolation=transforms.InterpolationMode.NEAREST,
-                    )
-                    if not self._mask_touches_border((np.array(aug_mask_r) > 0).astype(np.uint8)):
-                        img_used, mask_used = aug_img, aug_mask_r
-                        break
+        img_used, mask_used = img, mask  # default: no augmentation
+        if self.augment:
+            # Keep the first augmentation that leaves the whole lesion inside the
+            # frame. "light" tries once (else identity, the original recipe);
+            # "strong" retries so almost every sample is augmented.
+            attempts = 5 if self.aug_level == "strong" else 1
+            for _ in range(attempts):
+                aug_img, aug_mask = self._augment(img, mask)
+                aug_mask_r = TF.resize(
+                    aug_mask, self.img_size,
+                    interpolation=transforms.InterpolationMode.NEAREST,
+                )
+                if not self._mask_touches_border((np.array(aug_mask_r) > 0).astype(np.uint8)):
+                    img_used, mask_used = aug_img, aug_mask_r
+                    break
 
-            # Resize mask (nearest) and build binary map.
-            mask_r = TF.resize(
-                mask_used, self.img_size,
-                interpolation=transforms.InterpolationMode.NEAREST,
-            )
-            mask_binary = (np.array(mask_r) > 0).astype(np.uint8) * 255
+        # Resize mask (nearest) and build binary map.
+        mask_r = TF.resize(
+            mask_used, self.img_size,
+            interpolation=transforms.InterpolationMode.NEAREST,
+        )
+        mask_binary = (np.array(mask_r) > 0).astype(np.uint8) * 255
 
-            points = self._contour_points(mask_binary)
-            if points is not None:
-                points = points.astype(np.float32)
-                H, W = self.img_size
-                points[:, 0] = points[:, 0] / (W - 1)
-                points[:, 1] = points[:, 1] / (H - 1)
-                points = points * 2.0 - 1.0
+        # Ground-truth boundary points in [-1, 1] (x, y).
+        points = self._contour_points(mask_binary).astype(np.float32)
+        H, W = self.img_size
+        points[:, 0] = points[:, 0] / (W - 1)
+        points[:, 1] = points[:, 1] / (H - 1)
+        points = points * 2.0 - 1.0
 
-                img_tensor = self.img_transform(img_used)
-                points_tensor = torch.from_numpy(points)
-                mask_tensor = torch.from_numpy((mask_binary > 0).astype(np.float32)).unsqueeze(0)
-                return img_tensor, points_tensor, mask_tensor
+        img_tensor = self.img_transform(img_used)
+        points_tensor = torch.from_numpy(points)
+        mask_tensor = torch.from_numpy((mask_binary > 0).astype(np.float32)).unsqueeze(0)
 
-            idx = random.randrange(len(self))
-
-        raise RuntimeError("Could not find a sample with a valid contour.")
+        return img_tensor, points_tensor, mask_tensor
 
 
 class ArrayContourDataset(PH2ContourDataset):
@@ -239,9 +286,8 @@ class ArrayContourDataset(PH2ContourDataset):
     arrays (in their stored order) lets us reproduce the published index splits
     exactly.
     """
-
     def __init__(self, images, masks, n_points=200, img_size=(224, 224),
-                 augment=False, aug_level="strong"):
+                 augment=False, aug_level="strong", adaptive_sampling=True): 
         # Bypass PH2's file-discovery __init__; set up the base fields directly.
         Dataset.__init__(self)
         self.images = images
@@ -250,6 +296,7 @@ class ArrayContourDataset(PH2ContourDataset):
         self.img_size = img_size
         self.augment = augment and aug_level != "none"
         self.aug_level = aug_level
+        self.adaptive_sampling = adaptive_sampling 
         self.img_transform = transforms.Compose([
             transforms.Resize(img_size),
             transforms.ToTensor(),

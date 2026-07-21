@@ -67,7 +67,7 @@ def _slices(dataset, n):
 
 def build_contour_dataset(skin_root, dataset, split, n_points=200,
                           img_size=(224, 224), augment=False, aug_level="strong",
-                          npy_size=224):
+                          npy_size=224, adaptive_sampling=True): 
     """Return an ArrayContourDataset for one split of a named dataset."""
     dataset = dataset.lower()
     if dataset not in DATASET_DIRS:
@@ -81,6 +81,7 @@ def build_contour_dataset(skin_root, dataset, split, n_points=200,
     return ArrayContourDataset(
         X[sel], Y[sel], n_points=n_points, img_size=img_size,
         augment=augment, aug_level=aug_level,
+        adaptive_sampling=adaptive_sampling, 
     )
 
 

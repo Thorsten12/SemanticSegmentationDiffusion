@@ -11,39 +11,39 @@ from typing import Tuple
 @dataclass
 class Config:
     # ----- data -----
-    skin_root: str = "/loctmp/sit28238/SemanticSegmentationDiffusion/data/datasets"
+    # Datasets are read from preprocessed npy under <skin_root>/<DATASET>/np/ and
+    # split by the published index ranges (see data/seg_datasets.py), so the
+    # train/val/test partition matches the reference exactly.
+    skin_root: str = "/hdd/datasets/Skin"
     dataset: str = "ph2"                          # ph2 | isic2017 | isic2018 | ham10000
-    npy_size: int = 224
-    img_size: Tuple[int, int] = (224, 224)
-    n_points: int = 200
-    augment: bool = True
+    npy_size: int = 224                           # resolution of the stored npy arrays
+    img_size: Tuple[int, int] = (224, 224)        # (H, W) fed to the model
+    n_points: int = 200                           # boundary points per contour
+    augment: bool = True                          # train-time augmentation
     aug_level: str = "light"                      # "none" | "light" | "strong"
+    # (legacy: file-based PH2 split; unused by the npy split path above)
     data_root: str = "/hdd/datasets/Skin/PH2"
     n_val: int = 20
     n_test: int = 40
     split_seed: int = 42
 
-    # ----- TTA and Augmentation Extensions -----
-    tta: bool = False
-    mid_frequency_gain: float = 1.5
-    edge_frequency_gain: float = 1.2
-    adaptive_uniformity: bool = True
-
     # ----- model: conditioning encoder -----
-    in_channels: int = 3
-    encoder: str = "convnext"
-    cond_channels: int = 64
-    stem_dim: int = 32
+    in_channels: int = 3                         # image-only conditioning (RGB)
+    encoder: str = "convnext"                    # "convnext" | "pvt" | "unet"
+    cond_channels: int = 64                      # channels of the condition feature map
+    stem_dim: int = 32                           # full-res learnable stem prepended to pretrained pyramid (0 = off)
 
-    backbone: str = "convnext_tiny"
-    pretrained: bool = True
-    freeze_backbone: bool = False
-    backbone_lr: float = 1e-5
-    pretrained_weights: str | None = None
+    # pretrained-backbone path ("convnext")
+    backbone: str = "convnext_tiny"              # any timm features_only model
+    pretrained: bool = True                      # load pretrained weights
+    freeze_backbone: bool = False                # if True, train only fusion + denoiser
+    backbone_lr: float = 1e-5                    # low LR for pretrained backbone when fine-tuning
 
+    # PVT path ("pvt"): uses local models/pvtv2.py + pretrained_pth/pvt/*.pth
     pvt_variant: str = "pvt_v2_b2"
     pvt_pretrained_path: str = "pretrained_pth/pvt/pvt_v2_b2.pth"
 
+    # from-scratch U-Net path ("unet")
     unet_start_dim: int = 64
     unet_dim_mults: Tuple[int, ...] = (1, 2, 4)
     unet_groupnorm_groups: int = 16
@@ -54,46 +54,29 @@ class Config:
     n_heads: int = 4
 
     # ----- positional encoding -----
-    coord_fourier_bands: int = 6
-    pos_grid_bands: int = 0
+    # Band counts are deliberately small; frequencies are capped (see positional.py)
+    # so high bands don't become aliasing noise the model overfits to. The
+    # coordinate PE enters the denoiser ONLY via an additive path (safe). Injecting
+    # position into the guidance *content* map (pos_grid) is the same kind of
+    # position/content entanglement that caused validation collapse on this tiny
+    # dataset, so it is disabled by default.
+    coord_fourier_bands: int = 6    # NeRF-style PE of point coordinates (additive)
+    pos_grid_bands: int = 0         # 2D Fourier grid in the guidance map (0 = off)
 
     # ----- diffusion -----
     timesteps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 2e-2
     ddim_steps: int = 50
-    guidance_scale: float = 2.0
-    cfg_dropout: float = 0.15
-    x0_clamp: float = 1.2
+    guidance_scale: float = 2.0                   # ~1.5 (tiny PH2) .. 2.0 (big sets); >=5 over-guides to borders & collapses
+    cfg_dropout: float = 0.15                    # prob. of dropping conditioning in training
+    x0_clamp: float = 1.2                        # clamp predicted x0 during training
 
     # ----- loss -----
-    lambda_uniformity: float = 0.1
-    lambda_dice: float = 1.0
-    # lambda_boundary: kept small so boundary term stays O(1) relative to
-    #   the Kendall noise loss after the NOISE_SCALE fix in diffusion.py.
-    lambda_boundary: float = 0.1
-    snr_gamma: float = 5.0
-
-    # ------------------------------------------------------------------ #
-    # Uncertainty head                                                     #
-    # ------------------------------------------------------------------ #
-    # lambda_uncertainty: scales the log(sigma) penalty in the Kendall loss.
-    #   0.5  = model can express more uncertainty (sigma drifts lower freely)
-    #   1.0  = exact Kendall & Gal formulation
-    #   2.0  = tight regularization, sigma stays close to 1
-    #
-    # With NOISE_SCALE=100 on the precision term, lambda_uncertainty=0.5
-    # gives the penalty roughly 1/200 the weight of the reconstruction term
-    # at sigma=1, which is a reasonable starting balance.
-    lambda_uncertainty: float = 0.5
-
-    # uncertainty_skip_threshold: sigma = exp(log_sigma) below this value
-    #   causes a point to be frozen in ddim_sample after the first DDIM step.
-    #   None = disabled (full 50-step sampling for all points, safe default).
-    #   0.3  = good starting value once the uncertainty head is calibrated
-    #          (run ~50 epochs without skipping first to let sigma stabilise).
-    #   0.5  = aggressive skipping; faster but may hurt accuracy on fine edges.
-    uncertainty_skip_threshold: float | None = None
+    lambda_uniformity: float = 0.1              # weight of neighbor-spacing regularizer
+    lambda_dice: float = 1.0                    # weight of differentiable soft-Dice (mask-level)
+    soft_dice_size: int = 64                    # soft-raster resolution (higher = sharper boundary grad)
+    snr_gamma: float = 5.0                      # min-SNR-gamma cap for per-sample x0 weighting
 
     # ----- optimization -----
     epochs: int = 300
@@ -104,13 +87,19 @@ class Config:
     amp: bool = True
     num_workers: int = 4
     grad_clip: float = 1.0
+    scheduler: str = "cosine"                    # "none" | "cosine"
+    warmup_epochs: int = 5
+    min_lr: float = 1e-6
+    # Warm-start from a previous EMA checkpoint (transfer learning).
+    init_checkpoint: str = ""
+    init_from_ema: bool = True                   # unused alias; checkpoint already stores EMA weights
 
     # ----- bookkeeping -----
     out_dir: str = "src/runs/baseline"
     seed: int = 0
     device: str = "cuda"
     log_every: int = 20
-    eval_every: int = 20
+    eval_every: int = 20                         # epochs between validation evals
 
     @classmethod
     def from_args(cls, args) -> "Config":
