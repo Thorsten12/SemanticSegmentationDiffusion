@@ -1,0 +1,15 @@
+{
+  "out_dir": "src/runs/v2_isic17_ft_ham_e150",
+  "dataset": "isic2017",
+  "best_val_dice": 0.884016082261147,
+  "test_dice": 0.8837789810822676,
+  "test_iou": 0.8030105810974592,
+  "epochs": 150,
+  "lr": 5e-05,
+  "weight_decay": 0.0001,
+  "scheduler": "cosine",
+  "backbone": "convnext_tiny",
+  "guidance_scale": 1.5,
+  "aug_level": "light",
+  "freeze_backbone": false
+}

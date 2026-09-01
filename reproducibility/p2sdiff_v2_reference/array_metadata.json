@@ -1,0 +1,154 @@
+{
+  "ph2": {
+    "directory": "PH2",
+    "counts": {
+      "train": 80,
+      "val": 20,
+      "test": 100
+    },
+    "arrays": {
+      "X": {
+        "filename": "X_tr_224x224.npy",
+        "shape": [
+          200,
+          3,
+          224,
+          224
+        ],
+        "dtype": "uint8",
+        "min": 1,
+        "max": 255,
+        "bytes": 30105728,
+        "sha256": "a71acf04b25793a1372eedf649fd0862cdbfe0b35bfa103256a1d6faaa3a9e37"
+      },
+      "Y": {
+        "filename": "Y_tr_224x224.npy",
+        "shape": [
+          200,
+          1,
+          224,
+          224
+        ],
+        "dtype": "uint8",
+        "min": 0,
+        "max": 255,
+        "bytes": 10035328,
+        "sha256": "392fbbbb8a47c2a935e001e262f65be0f7ad14432ce69a69044c3df87c02fec6"
+      }
+    }
+  },
+  "isic2017": {
+    "directory": "ISIC2017",
+    "counts": {
+      "train": 1250,
+      "val": 150,
+      "test": 600
+    },
+    "arrays": {
+      "X": {
+        "filename": "X_tr_224x224.npy",
+        "shape": [
+          2000,
+          3,
+          224,
+          224
+        ],
+        "dtype": "uint8",
+        "min": 0,
+        "max": 255,
+        "bytes": 301056128,
+        "sha256": "f9dcca2b665254d971799ca91e20c2933647ede7ffc8728f7ddd6358fa0da5f2"
+      },
+      "Y": {
+        "filename": "Y_tr_224x224.npy",
+        "shape": [
+          2000,
+          1,
+          224,
+          224
+        ],
+        "dtype": "uint8",
+        "min": 0,
+        "max": 255,
+        "bytes": 100352128,
+        "sha256": "5777b54e7a701d9404749998cff4fbfdea7d7db8462485ba5dfbb3efd097b6cd"
+      }
+    }
+  },
+  "isic2018": {
+    "directory": "ISIC2018",
+    "counts": {
+      "train": 1815,
+      "val": 259,
+      "test": 520
+    },
+    "arrays": {
+      "X": {
+        "filename": "X_tr_224x224.npy",
+        "shape": [
+          2594,
+          3,
+          224,
+          224
+        ],
+        "dtype": "uint8",
+        "min": 0,
+        "max": 255,
+        "bytes": 390469760,
+        "sha256": "5912efce3927ba08c42256ea1a38425fcc07b187a7ccb035d328793b8efaae6c"
+      },
+      "Y": {
+        "filename": "Y_tr_224x224.npy",
+        "shape": [
+          2594,
+          1,
+          224,
+          224
+        ],
+        "dtype": "uint8",
+        "min": 0,
+        "max": 255,
+        "bytes": 130156672,
+        "sha256": "07b1d76f38d97fcf0bed556ef15d03564e925c7edd77e729eee5e2618f7a3098"
+      }
+    }
+  },
+  "ham10000": {
+    "directory": "HAM10000",
+    "counts": {
+      "train": 7200,
+      "val": 1800,
+      "test": 1015
+    },
+    "arrays": {
+      "X": {
+        "filename": "X_tr_224x224.npy",
+        "shape": [
+          10015,
+          3,
+          224,
+          224
+        ],
+        "dtype": "uint8",
+        "min": 0,
+        "max": 255,
+        "bytes": 1507538048,
+        "sha256": "413dac2c6d6748fb2e0d35f419268857b07cb54377e14d480643483f7ce22391"
+      },
+      "Y": {
+        "filename": "Y_tr_224x224.npy",
+        "shape": [
+          10015,
+          1,
+          224,
+          224
+        ],
+        "dtype": "uint8",
+        "min": 0,
+        "max": 255,
+        "bytes": 502512768,
+        "sha256": "2254feb9cfcf703dc77933683dc63ec92545d56735b35b9aeab1530188af1a68"
+      }
+    }
+  }
+}

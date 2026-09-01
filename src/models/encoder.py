@@ -1,21 +1,11 @@
-"""Conditioning encoders: image -> raw multi-scale feature pyramid.
+"""Image -> multi-scale feature pyramid (finest first).
 
-Each encoder exposes a uniform interface:
+Backbones only produce 2D features. DP2Seg consumes the list at contour points.
 
-    extract(image)      -> list of feature maps (the raw pyramid)  (run ONCE per image)
-    fuse(raw, t)        -> raw (identity; kept for interface symmetry)
-    forward(image, t)   -> extract(image)
-    .feature_channels   -> list of per-scale channel counts
-
-The actual multi-scale combination is done PER POINT and PER TIMESTEP inside the
-denoiser's `MultiScalePointSampler` (sample every scale at each point, gate scales
-by time, MLP-summarize). So the encoder's only job is to produce a good pyramid;
-the heavy backbone runs once per image while the cheap per-point query/gate runs
-each diffusion step.
-
-  * ConvNeXtConditioner : frozen/fine-tuned timm ConvNeXt (ImageNet).
-  * PVTConditioner      : pvt_v2 (local models/pvtv2.py) — a transformer pyramid.
-  * UNetConditioner     : from-scratch FeatureUNet (single-scale, for ablation).
+  * ConvNeXtConditioner : timm ConvNeXt (ImageNet)
+  * PVTConditioner      : PVT-v2 pyramid
+  * TimmConditioner     : any timm `features_only` model
+  * UNetConditioner     : from-scratch encoder + bottleneck
 """
 
 import os
@@ -39,13 +29,9 @@ class _PretrainedPyramid(nn.Module):
             self.backbone.eval()
 
     def _setup_stem(self, stem_dim):
-        """Optional full-resolution learnable feature map prepended to the pyramid.
+        """Full-resolution stem so points can read pixel-precise cues (stride 1).
 
-        Pretrained backbones only emit features down to stride 4 (finest 56x56 at
-        224), capping how precisely a boundary point can read image cues. This
-        small conv stem produces a stride-1 (full-res) feature map so points get
-        pixel-precise local cues *in addition* to the backbone's semantics. Always
-        trainable, even when the backbone is frozen.
+        Pretrained pyramids stop at stride 4. Always trainable, even if frozen.
         """
         if stem_dim and stem_dim > 0:
             g = min(8, stem_dim)
@@ -59,7 +45,6 @@ class _PretrainedPyramid(nn.Module):
             self.stem = None
 
     def _preprocess(self, image):
-        """Dataset images are in [-1, 1]; map to [0, 1] then ImageNet-normalize."""
         x = image * 0.5 + 0.5
         return (x - self.norm_mean) / self.norm_std
 
@@ -71,39 +56,41 @@ class _PretrainedPyramid(nn.Module):
         else:
             feats = list(self.backbone(x))
         if getattr(self, "stem", None) is not None:
-            feats = [self.stem(x)] + feats          # full-res scale, finest first
+            feats = [self.stem(x)] + feats
         return feats
 
-    def fuse(self, feats, t):
-        return feats                     # combination happens per-point in the denoiser
-
-    def forward(self, image, t):
+    def forward(self, image, t=None):
         return self.extract(image)
 
     def train(self, mode=True):
         super().train(mode)
         if self.freeze:
-            self.backbone.eval()         # keep frozen backbone (and norm stats) in eval
+            self.backbone.eval()
         return self
 
 
 class ConvNeXtConditioner(_PretrainedPyramid):
     def __init__(self, backbone="convnext_tiny", pretrained=True, freeze=False, stem_dim=32):
         super().__init__()
-        import timm  # local import: only needed for this encoder
+        import timm
         self.backbone = timm.create_model(
-            backbone, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3)
+            backbone, pretrained=pretrained, features_only=True, out_indices=(0, 1, 2, 3),
         )
         self.feature_channels = list(self.backbone.feature_info.channels())
         cfg = getattr(self.backbone, "pretrained_cfg", None) or {}
-        self._setup_norm_freeze(cfg.get("mean", (0.485, 0.456, 0.406)),
-                                cfg.get("std", (0.229, 0.224, 0.225)), freeze)
+        self._setup_norm_freeze(
+            cfg.get("mean", (0.485, 0.456, 0.406)),
+            cfg.get("std", (0.229, 0.224, 0.225)), freeze,
+        )
         self._setup_stem(stem_dim)
 
 
+class TimmConditioner(ConvNeXtConditioner):
+    """Any timm features_only pyramid (ResNet, EfficientNet, ...)."""
+
+
 class PVTConditioner(_PretrainedPyramid):
-    """Pyramid Vision Transformer v2 (local pvtv2.py). pvt_v2_b2: channels
-    [64,128,320,512] at strides [4,8,16,32] (finest = image/4)."""
+    """PVT-v2-b2: channels [64,128,320,512] at strides [4,8,16,32]."""
 
     def __init__(self, variant="pvt_v2_b2", pretrained_path=None, freeze=False, stem_dim=32):
         super().__init__()
@@ -116,47 +103,50 @@ class PVTConditioner(_PretrainedPyramid):
         self.backbone.eval()
         with torch.no_grad():
             self.feature_channels = [f.shape[1] for f in self.backbone(torch.zeros(1, 3, 64, 64))]
-        # PVT uses standard ImageNet normalization.
         self._setup_norm_freeze((0.485, 0.456, 0.406), (0.229, 0.224, 0.225), freeze)
         self._setup_stem(stem_dim)
 
 
 class UNetConditioner(nn.Module):
-    """Single-scale conditioner wrapping the from-scratch FeatureUNet (ablation)."""
+    """From-scratch U-Net encoder + bottleneck (no pixel decoder)."""
 
-    def __init__(self, in_channels=3, cond_dim=64, start_dim=64,
-                 dim_mults=(1, 2, 4), groups=16):
+    def __init__(self, in_channels=3, start_dim=64, dim_mults=(1, 2, 4), groups=16):
         super().__init__()
-        self.unet = FeatureUNet(in_channels, start_dim, dim_mults, cond_dim, groups)
-        self.feature_channels = [cond_dim]
+        self.unet = FeatureUNet(in_channels, start_dim, dim_mults, groups)
+        self.feature_channels = list(self.unet.feature_channels)
         self.freeze = False
 
     def extract(self, image):
-        return self.unet(image)          # list of one map
+        return self.unet(image)
 
-    def fuse(self, feats, t):
-        return feats
-
-    def forward(self, image, t):
+    def forward(self, image, t=None):
         return self.unet(image)
 
 
 def build_conditioner(cfg):
+    stem = cfg.stem_dim
     if cfg.encoder == "convnext":
         return ConvNeXtConditioner(
-            backbone=cfg.backbone, pretrained=cfg.pretrained, freeze=cfg.freeze_backbone,
-            stem_dim=cfg.stem_dim,
+            backbone=cfg.backbone, pretrained=cfg.pretrained,
+            freeze=cfg.freeze_backbone, stem_dim=stem,
         )
-    elif cfg.encoder == "pvt":
+    if cfg.encoder == "timm":
+        return TimmConditioner(
+            backbone=cfg.backbone, pretrained=cfg.pretrained,
+            freeze=cfg.freeze_backbone, stem_dim=stem,
+        )
+    if cfg.encoder == "pvt":
         return PVTConditioner(
             variant=cfg.pvt_variant,
             pretrained_path=(cfg.pvt_pretrained_path if cfg.pretrained else None),
-            freeze=cfg.freeze_backbone, stem_dim=cfg.stem_dim,
+            freeze=cfg.freeze_backbone, stem_dim=stem,
         )
-    elif cfg.encoder == "unet":
+    if cfg.encoder == "unet":
         return UNetConditioner(
-            in_channels=cfg.in_channels, cond_dim=cfg.cond_channels,
+            in_channels=cfg.in_channels,
             start_dim=cfg.unet_start_dim, dim_mults=cfg.unet_dim_mults,
             groups=cfg.unet_groupnorm_groups,
         )
-    raise ValueError(f"Unknown encoder '{cfg.encoder}' (expected 'convnext', 'pvt', or 'unet').")
+    raise ValueError(
+        f"Unknown encoder '{cfg.encoder}' (expected convnext, pvt, unet, timm)."
+    )

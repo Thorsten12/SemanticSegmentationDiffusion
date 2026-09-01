@@ -1,21 +1,14 @@
-"""PH2 boundary-point dataset (flat layout).
+"""Contour dataset: image + ordered boundary points + binary mask.
 
-The PH2 data on disk is *flat*:
+Each sample:
+    image  : FloatTensor [3, H, W] in [-1, 1]
+    points : FloatTensor [N, 2]    in [-1, 1]  (arc-length uniform, top-started)
+    mask   : FloatTensor [1, H, W] in {0, 1}
 
-    <root>/trainx/IMD002.bmp            # dermoscopy image
-    <root>/trainy/IMD002_lesion.bmp     # binary lesion mask
-
-For each sample we return:
-    image  : FloatTensor [3, H, W] in [-1, 1]  (conditioning, RGB only)
-    points : FloatTensor [N, 2]    in [-1, 1]  (ground-truth boundary, ordered)
-    mask   : FloatTensor [1, H, W] in {0, 1}   (clean GT mask, for evaluation)
-
-Points are obtained from the mask via OpenCV contours + arc-length uniform
-resampling, then rolled so the topmost point is index 0 (a canonical starting
-phase for the ordered sequence).
+`PH2ContourDataset` reads file pairs `{id, img, mask}`.
+`ArrayContourDataset` reads preprocessed npy arrays (skin splits).
 """
 
-import os
 import random
 from typing import List, Tuple
 
@@ -50,39 +43,19 @@ def uniform_sampling(contour: np.ndarray, n: int) -> np.ndarray:
     return contour[idx] + seg[idx] * local_t[:, None]
 
 
-def _list_pairs(root: str) -> List[dict]:
-    """Discover (image, mask) path pairs from the flat trainx/trainy layout."""
-    img_dir = os.path.join(root, "trainx")
-    mask_dir = os.path.join(root, "trainy")
-    if not (os.path.isdir(img_dir) and os.path.isdir(mask_dir)):
-        raise FileNotFoundError(
-            f"Expected '{img_dir}' and '{mask_dir}'. Point --data_root at the "
-            f"folder that contains trainx/ and trainy/."
-        )
-
-    pairs = []
-    for fname in sorted(os.listdir(img_dir)):
-        if not fname.lower().endswith(".bmp"):
-            continue
-        stem = os.path.splitext(fname)[0]               # e.g. IMD002
-        mask_path = os.path.join(mask_dir, f"{stem}_lesion.bmp")
-        img_path = os.path.join(img_dir, fname)
-        if os.path.exists(mask_path):
-            pairs.append({"id": stem, "img": img_path, "mask": mask_path})
-    if not pairs:
-        raise RuntimeError(f"No image/mask pairs found under {root}.")
-    return pairs
-
-
-def make_splits(root: str, n_val: int, n_test: int, seed: int):
-    """Deterministic train/val/test split over the discovered pairs."""
-    pairs = _list_pairs(root)
-    rng = random.Random(seed)
-    rng.shuffle(pairs)
-    test = pairs[:n_test]
-    val = pairs[n_test:n_test + n_val]
-    train = pairs[n_test + n_val:]
-    return train, val, test
+def _as_uint8_rgb(img: np.ndarray) -> np.ndarray:
+    """Map float/uint MRI or RGB arrays to uint8 HWC RGB."""
+    img = np.asarray(img)
+    if np.issubdtype(img.dtype, np.floating):
+        x = img.astype(np.float32)
+        if x.min() < 0:
+            x = (x + 1.0) * 0.5
+        if x.max() <= 1.5:
+            x = x * 255.0
+        img = np.clip(x, 0, 255).astype(np.uint8)
+    else:
+        img = img.astype(np.uint8)
+    return img
 
 
 class PH2ContourDataset(Dataset):
@@ -170,7 +143,23 @@ class PH2ContourDataset(Dataset):
         if contour.ndim != 2 or contour.shape[0] < 3:
             return None
         points = uniform_sampling(contour, self.n_points)
-        top_idx = int(np.argmin(points[:, 1]))      # topmost point -> canonical start
+
+        # Canonicalize winding before choosing a start vertex.  A consistent
+        # point direction matters for coordinate diffusion because z_t[i] is
+        # generated from z_0[i].  In image coordinates (y grows downward), a
+        # positive shoelace area corresponds to the desired top->right winding.
+        nxt = np.roll(points, shift=-1, axis=0)
+        signed_area2 = np.sum(points[:, 0] * nxt[:, 1] - nxt[:, 0] * points[:, 1])
+        if signed_area2 < 0:
+            points = points[::-1].copy()
+
+        # Robust top anchor: among vertices within one pixel of the highest y,
+        # choose the one closest to the lesion's horizontal centroid.  This is
+        # less jumpy than argmin(y) on a flat/near-flat top boundary.
+        min_y = float(points[:, 1].min())
+        candidates = np.where(points[:, 1] <= min_y + 1.0)[0]
+        cx = float(points[:, 0].mean())
+        top_idx = int(candidates[np.argmin(np.abs(points[candidates, 0] - cx))])
         return np.roll(points, shift=-top_idx, axis=0)
 
     # --- main ----------------------------------------------------------------
@@ -260,8 +249,20 @@ class ArrayContourDataset(PH2ContourDataset):
         return len(self.images)
 
     def _load_raw(self, idx):
-        img = np.moveaxis(np.asarray(self.images[idx], dtype=np.uint8), 0, -1)  # HWC
-        m = np.asarray(self.masks[idx], dtype=np.uint8)
-        if m.ndim == 3:                      # [1, H, W] -> [H, W]
-            m = m.squeeze(0)
+        img = np.asarray(self.images[idx])
+        m = np.asarray(self.masks[idx])
+        img = _as_uint8_rgb(img)
+        if img.ndim == 3 and img.shape[0] in (1, 3) and img.shape[-1] not in (1, 3):
+            img = np.moveaxis(img, 0, -1)
+        if img.ndim == 2:
+            img = np.stack([img, img, img], axis=-1)
+        elif img.shape[-1] == 1:
+            img = np.repeat(img, 3, axis=-1)
+        m = np.squeeze(m)
+        if m.ndim != 2:
+            raise ValueError(f"mask must be 2D after squeeze, got {m.shape}")
+        if m.dtype != np.uint8:
+            m = (m > 0).astype(np.uint8) * 255
+        elif m.max() == 1:
+            m = m * 255
         return Image.fromarray(img).convert("RGB"), Image.fromarray(m).convert("L")

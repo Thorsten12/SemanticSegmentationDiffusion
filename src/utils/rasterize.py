@@ -58,6 +58,40 @@ def soft_dice_loss(pred_points, gt_masks, size=64, eps=1e-6):
     return (1.0 - dice).mean()
 
 
+
+def _morphological_band(x, width=2):
+    """Differentiable narrow band around a soft mask, outside image = background."""
+    r = max(int(width), 1)
+    k = 2 * r + 1
+    x4 = x.unsqueeze(1) if x.ndim == 3 else x
+    dil = F.max_pool2d(F.pad(x4, (r, r, r, r), value=0.0), k, stride=1)
+    ero = -F.max_pool2d(F.pad(-x4, (r, r, r, r), value=0.0), k, stride=1)
+    return (dil - ero).clamp(0.0, 1.0).squeeze(1)
+
+
+def soft_mask_boundary_losses(pred_points, gt_masks, size=96, band_width=2, eps=1e-6):
+    """Return (mask Dice loss, narrow-boundary Dice loss) from one rasterization.
+
+    The second term is deliberately sensitive to a polygon that has the right
+    area but a rounded/offset boundary -- the dominant V2 failure on PH2.
+    """
+    soft = soft_rasterize(pred_points.float(), size)
+    gt = F.interpolate(gt_masks.float(), size=(size, size), mode="nearest").squeeze(1)
+    gt = (gt > 0.5).float()
+
+    inter = (soft * gt).sum(dim=(1, 2))
+    denom = soft.sum(dim=(1, 2)) + gt.sum(dim=(1, 2))
+    mask_dice = (2.0 * inter + eps) / (denom + eps)
+    mask_loss = (1.0 - mask_dice).mean()
+
+    pred_band = _morphological_band(soft, width=band_width)
+    gt_band = _morphological_band(gt, width=band_width)
+    b_inter = (pred_band * gt_band).sum(dim=(1, 2))
+    b_denom = pred_band.sum(dim=(1, 2)) + gt_band.sum(dim=(1, 2))
+    b_dice = (2.0 * b_inter + eps) / (b_denom + eps)
+    boundary_loss = (1.0 - b_dice).mean()
+    return mask_loss, boundary_loss
+
 def points_to_mask(points, img_size):
     """Fill the ordered polygon defined by `points` ([-1,1]) into a binary mask.
 

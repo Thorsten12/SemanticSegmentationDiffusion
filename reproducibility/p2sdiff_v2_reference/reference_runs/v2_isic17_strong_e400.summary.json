@@ -1,0 +1,15 @@
+{
+  "out_dir": "src/runs/v2_isic17_strong_e400",
+  "dataset": "isic2017",
+  "best_val_dice": 0.8832031024606666,
+  "test_dice": 0.8813436905237578,
+  "test_iou": 0.7978249451767334,
+  "epochs": 400,
+  "lr": 0.0001,
+  "weight_decay": 0.0001,
+  "scheduler": "cosine",
+  "backbone": "convnext_tiny",
+  "guidance_scale": 1.5,
+  "aug_level": "strong",
+  "freeze_backbone": false
+}

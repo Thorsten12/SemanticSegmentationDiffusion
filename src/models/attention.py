@@ -1,4 +1,4 @@
-"""Small attention/MLP blocks shared by the U-Net and the denoiser."""
+"""Attention / MLP block used in the from-scratch U-Net bottleneck."""
 
 import torch.nn as nn
 import torch.nn.functional as F

@@ -1,0 +1,10 @@
+{
+  "git_commit": "b52da6c8b102bdba7732eb5717f615aeb24e7eaa",
+  "python": "3.10.16",
+  "packages": {
+    "torch": "2.9.1+cu130",
+    "torchvision": "0.24.1+cu130",
+    "numpy": "1.26.4",
+    "opencv-python": "4.11.0.86"
+  }
+}

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+PYTHON_BIN=${PYTHON_BIN:-python}
+"$PYTHON_BIN" -m src.train   --dataset ph2 --encoder unet --pretrained false --unet_start_dim 64   --n_points 100 --epochs 500 --batch_size 8 --lr 2e-4 --aug_level light   --eval_every 10 --eval_seed 314159   --proposal_type fourier --fourier_harmonics 4 --diffusion_target residual   --residual_normalization true --profile_samples 9 --profile_levels 2   --pointwise_scale_attention true --use_boundary_head false --use_post_snapper false   --timesteps 400 --ddim_steps 30 --guidance_scale 1.0 --cfg_dropout 0   --lambda_proposal_chamfer 1 --lambda_proposal_dice 1 --lambda_proposal_spectral 0.15   --proposal_warmup_epochs 30 --diffusion_ramp_epochs 30   --lambda_lowt_boundary 0.8 --lambda_lowt_hard 0.3 --lambda_tangent 0.04   --lambda_residual_bend 0.01 --lambda_boundary_head 0 --lambda_snap_teacher 0   --out_dir src/runs/ph2_v8_scratch

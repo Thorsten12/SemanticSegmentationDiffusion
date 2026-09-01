@@ -1,80 +1,93 @@
-"""Fourier positional encodings used to entangle *location* with *content*.
+"""Shared spatial encodings and point samplers.
 
-Frozen CNN backbones (ConvNeXt, ResNet, ...) are largely translation-equivariant:
-a feature describes appearance but not absolute position. The denoiser must move
-each point to a precise location, so we inject explicit positional information:
-
-* `FourierFeatures`  - NeRF-style sin/cos embedding of 2D point coordinates. Used
-  both to embed the points the denoiser is moving, and to tag each *sampled*
-  guidance feature with the exact coordinate it was read from (alignment by
-  construction, since the coordinate is known).
-* `PositionalGrid2D` - a 2D Fourier coordinate grid projected into the channel
-  space of a feature map and added to it, so the guidance map itself is
-  position-aware.
+Image coordinates always use ``(x, y)`` in ``[-1, 1]`` with
+``align_corners=True``.  Diffusion itself is allowed to live in an unbounded
+latent space; the denoiser converts its latent state to bounded image
+coordinates before anything in this module is called.
 """
 
 import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
-class FourierFeatures(nn.Module):
-    """Map coordinates `[..., in_dim]` -> `[..., out_dim]` sin/cos features."""
+class SharedCoordinatePE(nn.Module):
+    """Fourier encoding shared by 2-D feature grids and contour queries."""
 
-    def __init__(self, in_dim=2, num_bands=6, max_freq=32.0, include_input=True):
+    def __init__(self, num_bands=6, max_freq=32.0, include_input=True):
         super().__init__()
-        # Log-spaced frequencies in [1, max_freq] * pi. `max_freq` is bounded so
-        # the highest band stays below the spatial Nyquist limit of the data; with
-        # unbounded 2**arange the top bands become pure aliasing noise that the
-        # model overfits to (causes val collapse).
-        exps = torch.linspace(0.0, math.log2(max_freq), num_bands)
-        freqs = (2.0 ** exps) * math.pi
+        self.num_bands = int(num_bands)
+        self.max_freq = float(max_freq)
+        self.include_input = bool(include_input)
+        if self.num_bands <= 0:
+            freqs = torch.zeros(0)
+        else:
+            exps = torch.linspace(0.0, math.log2(self.max_freq), self.num_bands)
+            freqs = (2.0 ** exps) * math.pi
         self.register_buffer("freqs", freqs)
-        self.include_input = include_input
-        self.in_dim = in_dim
-        self.out_dim = in_dim * (2 * num_bands) + (in_dim if include_input else 0)
+        self.out_dim = 2 * (2 * self.num_bands) + (2 if include_input else 0)
 
-    def forward(self, x):
-        if self.freqs.numel() == 0:           # num_bands=0 -> PE disabled, raw coords
-            return x
-        proj = x[..., None] * self.freqs                       # [..., in_dim, B]
-        emb = torch.cat([proj.sin(), proj.cos()], dim=-1)      # [..., in_dim, 2B]
-        emb = emb.flatten(-2)                                  # [..., in_dim*2B]
+    def encode_points(self, xy, height=None):
+        """Encode ``xy`` [...,2] in the image coordinate frame."""
+        if self.freqs.numel() == 0:
+            return xy
+        proj = xy[..., None] * self.freqs
+        if height is not None:
+            mask = self._band_mask(height, xy.device, proj.dtype)
+            proj = proj * mask
+        emb = torch.cat([proj.sin(), proj.cos()], dim=-1).flatten(-2)
         if self.include_input:
-            emb = torch.cat([x, emb], dim=-1)
+            emb = torch.cat([xy, emb], dim=-1)
         return emb
 
+    def encode_grid(self, height, width, device, dtype, nyquist=True):
+        ys = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+        xs = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+        coords = torch.stack([gx, gy], dim=-1)
+        pe = self.encode_points(coords, height=height if nyquist else None)
+        return pe.permute(2, 0, 1).unsqueeze(0)
 
-class PositionalGrid2D(nn.Module):
-    """Add a projected 2D Fourier coordinate grid to a feature map `[B, C, H, W]`."""
+    def _band_mask(self, height, device, dtype):
+        nyquist = math.pi * max(int(height), 2) / 2.0
+        return (self.freqs <= nyquist).to(device=device, dtype=dtype)
 
-    def __init__(self, out_channels, num_bands=5, max_freq=16.0):
-        super().__init__()
-        self.num_bands = num_bands
-        # Bounded log-spaced frequencies (see FourierFeatures). The guidance map is
-        # low-resolution (stride 4), so cap the top band well below its Nyquist.
-        exps = torch.linspace(0.0, math.log2(max_freq), num_bands)
-        freqs = (2.0 ** exps) * math.pi
-        self.register_buffer("freqs", freqs)
-        self.proj = nn.Conv2d(4 * num_bands, out_channels, 1)
-        self._cache = {}                                       # (H, W, device) -> grid
 
-    def _grid(self, h, w, device, dtype):
-        key = (h, w, device)
-        pe = self._cache.get(key)
-        if pe is None:
-            ys = torch.linspace(-1, 1, h, device=device)
-            xs = torch.linspace(-1, 1, w, device=device)
-            gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-            coords = torch.stack([gx, gy], dim=0)             # [2, H, W]
-            proj = coords[..., None] * self.freqs             # [2, H, W, B]
-            emb = torch.cat([proj.sin(), proj.cos()], dim=-1) # [2, H, W, 2B]
-            pe = emb.permute(0, 3, 1, 2).reshape(4 * self.num_bands, h, w)
-            pe = pe.unsqueeze(0)                              # [1, 4B, H, W]
-            self._cache[key] = pe
-        return pe.to(dtype)
+def sample_aligned(feat, points, padding_mode="border"):
+    """Bilinear sample ``feat`` [B,C,H,W] at [B,N,2] image coordinates.
 
-    def forward(self, x):
-        pe = self._grid(x.shape[-2], x.shape[-1], x.device, x.dtype)
-        return x + self.proj(pe)
+    ``points`` should already be bounded.  A final clamp is intentionally kept
+    as a numerical guard for deformable offsets that may step just outside the
+    field of view; unlike the old decoder it is *not* used to turn Gaussian
+    diffusion coordinates into image coordinates.
+    """
+    grid = points.clamp(-1.0, 1.0).unsqueeze(1)
+    sampled = F.grid_sample(
+        feat, grid, mode="bilinear", padding_mode=padding_mode,
+        align_corners=True,
+    )
+    return sampled.squeeze(2).transpose(1, 2)
+
+
+def sample_deformable(feat, locations, padding_mode="border"):
+    """Sample K locations per contour vertex.
+
+    Parameters
+    ----------
+    feat: [B,C,H,W]
+    locations: [B,N,K,2] in image coordinates
+
+    Returns
+    -------
+    [B,N,K,C]
+    """
+    b, n, k, _ = locations.shape
+    grid = locations.clamp(-1.0, 1.0).reshape(b, n * k, 1, 2)
+    sampled = F.grid_sample(
+        feat, grid, mode="bilinear", padding_mode=padding_mode,
+        align_corners=True,
+    )
+    sampled = sampled.squeeze(-1).transpose(1, 2)
+    return sampled.reshape(b, n, k, feat.shape[1])

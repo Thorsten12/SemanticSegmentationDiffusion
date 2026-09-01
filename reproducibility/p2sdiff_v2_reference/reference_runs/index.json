@@ -1,0 +1,310 @@
+{
+  "v2_ham_n100_gs15_d05_e50": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_ham_n100_gs15_d05_e50",
+      "dataset": "ham10000",
+      "best_val_dice": 0.9155969839902173,
+      "test_dice": 0.9115802025040756,
+      "test_iou": 0.8459897739460818,
+      "epochs": 50,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "light",
+      "freeze_backbone": false
+    }
+  },
+  "v2_ham_strong_e60": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_ham_strong_e60",
+      "dataset": "ham10000",
+      "best_val_dice": 0.9156398442868383,
+      "test_dice": 0.9108234503878455,
+      "test_iou": 0.8452484688022305,
+      "epochs": 60,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "strong",
+      "freeze_backbone": false
+    }
+  },
+  "v2_isic17_ft_ham_e150": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_isic17_ft_ham_e150",
+      "dataset": "isic2017",
+      "best_val_dice": 0.884016082261147,
+      "test_dice": 0.8837789810822676,
+      "test_iou": 0.8030105810974592,
+      "epochs": 150,
+      "lr": 5e-05,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "light",
+      "freeze_backbone": false
+    }
+  },
+  "v2_isic17_n100_gs15_d05_e120": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_isic17_n100_gs15_d05_e120",
+      "dataset": "isic2017",
+      "best_val_dice": 0.8632084152244885,
+      "test_dice": 0.8623071820081297,
+      "test_iou": 0.7708013887488689,
+      "epochs": 120,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "light",
+      "freeze_backbone": false
+    }
+  },
+  "v2_isic17_n100_gs15_d05_e600": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_isic17_n100_gs15_d05_e600",
+      "dataset": "isic2017",
+      "best_val_dice": 0.8927223790527432,
+      "test_dice": 0.8929122045387,
+      "test_iou": 0.8168285676957149,
+      "epochs": 600,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "light",
+      "freeze_backbone": false
+    }
+  },
+  "v2_isic17_n150_gs15_d05_e400": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_isic17_n150_gs15_d05_e400",
+      "dataset": "isic2017",
+      "best_val_dice": 0.8776789255659467,
+      "test_dice": 0.8823901858713223,
+      "test_iou": 0.8003099288524647,
+      "epochs": 400,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "light",
+      "freeze_backbone": false
+    }
+  },
+  "v2_isic17_softdice96_e400": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_isic17_softdice96_e400",
+      "dataset": "isic2017",
+      "best_val_dice": 0.8821151576122573,
+      "test_dice": 0.8835451845803468,
+      "test_iou": 0.8015404333639029,
+      "epochs": 400,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "light",
+      "freeze_backbone": false
+    }
+  },
+  "v2_isic17_strong_e400": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_isic17_strong_e400",
+      "dataset": "isic2017",
+      "best_val_dice": 0.8832031024606666,
+      "test_dice": 0.8813436905237578,
+      "test_iou": 0.7978249451767334,
+      "epochs": 400,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "strong",
+      "freeze_backbone": false
+    }
+  },
+  "v2_isic18_ft_ham_e150": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_isic18_ft_ham_e150",
+      "dataset": "isic2018",
+      "best_val_dice": 0.8732188200646348,
+      "test_dice": 0.8729412518036674,
+      "test_iou": 0.7918183579033237,
+      "epochs": 150,
+      "lr": 5e-05,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "light",
+      "freeze_backbone": false
+    }
+  },
+  "v2_isic18_n100_gs15_d05_e400": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_isic18_n100_gs15_d05_e400",
+      "dataset": "isic2018",
+      "best_val_dice": 0.8803951762716393,
+      "test_dice": 0.8854020885285038,
+      "test_iou": 0.8072307923582185,
+      "epochs": 400,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "light",
+      "freeze_backbone": false
+    }
+  },
+  "v2_isic18_strong_e400": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_isic18_strong_e400",
+      "dataset": "isic2018",
+      "best_val_dice": 0.8782479349852852,
+      "test_dice": 0.881666845034697,
+      "test_iou": 0.8015514195845588,
+      "epochs": 400,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "strong",
+      "freeze_backbone": false
+    }
+  },
+  "v2_ph2_ft_ham_e400": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_ph2_ft_ham_e400",
+      "dataset": "ph2",
+      "best_val_dice": 0.9365882158168306,
+      "test_dice": 0.9214821745922337,
+      "test_iou": 0.8579176152971415,
+      "epochs": 400,
+      "lr": 5e-05,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "light",
+      "freeze_backbone": false
+    }
+  },
+  "v2_ph2_n100_gs15_d05_e800": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_ph2_n100_gs15_d05_e800",
+      "dataset": "ph2",
+      "best_val_dice": 0.9234926514180808,
+      "test_dice": 0.9058639168938666,
+      "test_iou": 0.8312012639381595,
+      "epochs": 800,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "light",
+      "freeze_backbone": false
+    }
+  },
+  "v2_ph2_n100_strong_e800": {
+    "files": [
+      "config.json",
+      "summary.json",
+      "test_metrics.json"
+    ],
+    "summary": {
+      "out_dir": "src/runs/v2_ph2_n100_strong_e800",
+      "dataset": "ph2",
+      "best_val_dice": 0.9190062474069082,
+      "test_dice": 0.9037739758960163,
+      "test_iou": 0.8278251470984825,
+      "epochs": 800,
+      "lr": 0.0001,
+      "weight_decay": 0.0001,
+      "scheduler": "cosine",
+      "backbone": "convnext_tiny",
+      "guidance_scale": 1.5,
+      "aug_level": "strong",
+      "freeze_backbone": false
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "out_dir": "src/runs/v2_ph2_ft_ham_e400",
+  "dataset": "ph2",
+  "best_val_dice": 0.9365882158168306,
+  "test_dice": 0.9214821745922337,
+  "test_iou": 0.8579176152971415,
+  "epochs": 400,
+  "lr": 5e-05,
+  "weight_decay": 0.0001,
+  "scheduler": "cosine",
+  "backbone": "convnext_tiny",
+  "guidance_scale": 1.5,
+  "aug_level": "light",
+  "freeze_backbone": false
+}

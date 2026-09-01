@@ -1,0 +1,15 @@
+{
+  "out_dir": "src/runs/v2_ph2_n100_strong_e800",
+  "dataset": "ph2",
+  "best_val_dice": 0.9190062474069082,
+  "test_dice": 0.9037739758960163,
+  "test_iou": 0.8278251470984825,
+  "epochs": 800,
+  "lr": 0.0001,
+  "weight_decay": 0.0001,
+  "scheduler": "cosine",
+  "backbone": "convnext_tiny",
+  "guidance_scale": 1.5,
+  "aug_level": "strong",
+  "freeze_backbone": false
+}

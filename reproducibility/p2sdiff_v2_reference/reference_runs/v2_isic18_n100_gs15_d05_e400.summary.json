@@ -1,0 +1,15 @@
+{
+  "out_dir": "src/runs/v2_isic18_n100_gs15_d05_e400",
+  "dataset": "isic2018",
+  "best_val_dice": 0.8803951762716393,
+  "test_dice": 0.8854020885285038,
+  "test_iou": 0.8072307923582185,
+  "epochs": 400,
+  "lr": 0.0001,
+  "weight_decay": 0.0001,
+  "scheduler": "cosine",
+  "backbone": "convnext_tiny",
+  "guidance_scale": 1.5,
+  "aug_level": "light",
+  "freeze_backbone": false
+}

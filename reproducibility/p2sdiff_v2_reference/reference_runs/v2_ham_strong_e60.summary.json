@@ -1,0 +1,15 @@
+{
+  "out_dir": "src/runs/v2_ham_strong_e60",
+  "dataset": "ham10000",
+  "best_val_dice": 0.9156398442868383,
+  "test_dice": 0.9108234503878455,
+  "test_iou": 0.8452484688022305,
+  "epochs": 60,
+  "lr": 0.0001,
+  "weight_decay": 0.0001,
+  "scheduler": "cosine",
+  "backbone": "convnext_tiny",
+  "guidance_scale": 1.5,
+  "aug_level": "strong",
+  "freeze_backbone": false
+}
