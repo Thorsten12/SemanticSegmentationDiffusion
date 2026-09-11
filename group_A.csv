@@ -1,0 +1,95 @@
+encoder,decoder,dataset,n_seeds,test_dice,test_iou,ph2_zeroshot_dice,ph2_zeroshot_iou,total_params_M,flops_G,latency_ms_per_image,peak_memory_MB
+convnext,baseline_cascade,busi,5,81.94 ± 0.98,73.42 ± 1.06,-,-,38.29,8.81,15.09,968.30
+convnext,baseline_cascade,isic2018,5,89.84 ± 0.36,83.04 ± 0.46,91.03 ± 0.31,84.27 ± 0.54,38.29,8.81,15.00,968.30
+convnext,baseline_cascade,polyp_kvasir,5,91.16 ± 0.42,85.93 ± 0.71,-,-,38.29,8.81,15.24,968.30
+convnext,baseline_cascade,tn3k,5,84.08 ± 0.29,76.41 ± 0.30,-,-,38.29,8.81,15.14,968.30
+convnext,baseline_emcad,busi,5,82.39 ± 0.72,73.80 ± 0.91,-,-,30.07,6.38,14.58,802.30
+convnext,baseline_emcad,isic2018,5,89.74 ± 0.13,82.84 ± 0.18,91.03 ± 0.46,84.29 ± 0.75,30.07,6.38,14.45,807.02
+convnext,baseline_emcad,polyp_kvasir,5,91.05 ± 0.55,85.92 ± 0.62,-,-,30.07,6.38,11.80,802.57
+convnext,baseline_emcad,tn3k,5,83.43 ± 0.16,75.50 ± 0.21,-,-,30.07,6.38,11.70,803.09
+convnext,baseline_linear_mlp,busi,5,82.17 ± 0.79,73.39 ± 0.95,-,-,27.91,5.89,7.70,752.22
+convnext,baseline_linear_mlp,isic2018,5,89.99 ± 0.13,83.19 ± 0.19,91.14 ± 0.19,84.43 ± 0.30,27.91,5.89,7.73,752.22
+convnext,baseline_linear_mlp,polyp_kvasir,5,91.16 ± 0.42,85.79 ± 0.43,-,-,27.91,5.89,7.71,752.22
+convnext,baseline_linear_mlp,tn3k,5,83.96 ± 0.26,76.07 ± 0.20,-,-,27.91,5.89,7.79,752.22
+convnext,baseline_semantic_fpn,busi,5,82.80 ± 0.43,74.36 ± 0.61,-,-,28.24,6.23,8.66,758.44
+convnext,baseline_semantic_fpn,isic2018,5,89.70 ± 0.17,82.84 ± 0.17,91.12 ± 0.38,84.36 ± 0.61,28.24,6.23,8.75,758.44
+convnext,baseline_semantic_fpn,polyp_kvasir,5,90.78 ± 0.68,85.43 ± 1.13,-,-,28.24,6.23,8.55,758.44
+convnext,baseline_semantic_fpn,tn3k,5,83.67 ± 0.40,75.81 ± 0.51,-,-,28.24,6.23,7.82,758.44
+convnext,baseline_unet,busi,5,81.73 ± 1.04,72.90 ± 1.27,-,-,32.04,14.15,13.76,753.38
+convnext,baseline_unet,isic2018,5,89.67 ± 0.39,82.85 ± 0.45,91.17 ± 0.44,84.44 ± 0.72,32.04,14.15,13.85,753.38
+convnext,baseline_unet,polyp_kvasir,5,90.93 ± 0.53,85.56 ± 0.57,-,-,32.04,14.15,13.71,753.38
+convnext,baseline_unet,tn3k,5,83.84 ± 0.41,76.03 ± 0.52,-,-,32.04,14.15,13.75,753.38
+convnext,baseline_upernet,busi,5,81.69 ± 2.68,73.18 ± 3.14,-,-,28.65,6.72,8.96,762.73
+convnext,baseline_upernet,isic2018,5,89.61 ± 0.50,82.73 ± 0.66,91.20 ± 0.30,84.47 ± 0.46,28.65,6.72,9.03,762.73
+convnext,baseline_upernet,polyp_kvasir,5,91.27 ± 0.29,86.06 ± 0.31,-,-,28.65,6.72,8.64,762.73
+convnext,baseline_upernet,tn3k,5,83.75 ± 0.26,75.92 ± 0.33,-,-,28.65,6.72,8.28,762.73
+pvt,baseline_cascade,busi,5,82.76 ± 0.70,74.45 ± 0.79,-,-,33.80,8.01,17.23,870.84
+pvt,baseline_cascade,isic2018,5,90.35 ± 0.14,83.84 ± 0.17,91.04 ± 0.44,84.21 ± 0.69,33.80,8.01,17.37,870.84
+pvt,baseline_cascade,tn3k,2,84.59 ± 0.24,76.75 ± 0.32,-,-,33.80,8.01,17.30,870.84
+pvt,baseline_emcad,busi,5,82.45 ± 0.67,74.04 ± 0.66,-,-,26.94,5.85,16.97,726.53
+pvt,baseline_emcad,isic2018,5,90.15 ± 0.20,83.57 ± 0.26,91.62 ± 0.34,85.16 ± 0.54,26.94,5.85,16.88,726.53
+pvt,baseline_emcad,tn3k,5,84.07 ± 0.16,76.13 ± 0.27,-,-,26.94,5.85,16.96,727.25
+pvt,baseline_linear_mlp,busi,5,82.26 ± 0.54,73.62 ± 0.66,-,-,24.92,5.38,12.92,683.32
+pvt,baseline_linear_mlp,isic2018,5,90.48 ± 0.38,83.94 ± 0.47,91.24 ± 0.25,84.51 ± 0.43,24.92,5.38,12.90,683.32
+pvt,baseline_linear_mlp,polyp_kvasir,5,91.80 ± 0.25,86.50 ± 0.40,-,-,24.92,5.38,12.95,683.06
+pvt,baseline_linear_mlp,tn3k,5,83.60 ± 0.59,75.19 ± 0.71,-,-,24.92,5.38,12.91,683.32
+pvt,baseline_semantic_fpn,busi,5,82.28 ± 0.65,73.66 ± 0.68,-,-,25.25,5.71,13.85,689.67
+pvt,baseline_semantic_fpn,isic2018,5,90.17 ± 0.31,83.59 ± 0.39,91.17 ± 0.43,84.43 ± 0.74,25.25,5.71,14.27,689.67
+pvt,baseline_semantic_fpn,polyp_kvasir,5,91.32 ± 0.53,86.05 ± 0.61,-,-,25.25,5.71,14.25,689.15
+pvt,baseline_semantic_fpn,tn3k,5,84.30 ± 0.44,76.29 ± 0.46,-,-,25.25,5.71,13.79,689.67
+pvt,baseline_unet,busi,5,82.38 ± 0.79,73.94 ± 0.89,-,-,28.25,13.32,18.33,670.10
+pvt,baseline_unet,isic2018,5,90.26 ± 0.15,83.64 ± 0.26,91.60 ± 0.47,85.09 ± 0.75,28.25,13.32,19.00,670.10
+pvt,baseline_unet,polyp_kvasir,5,91.11 ± 0.66,85.87 ± 0.72,-,-,28.25,13.32,19.40,670.10
+pvt,baseline_unet,tn3k,5,84.33 ± 0.32,76.40 ± 0.41,-,-,28.25,13.32,19.48,670.10
+pvt,baseline_upernet,busi,5,82.19 ± 0.79,73.70 ± 0.95,-,-,25.51,6.20,14.23,696.21
+pvt,baseline_upernet,isic2018,5,90.41 ± 0.15,83.83 ± 0.18,91.49 ± 0.52,84.96 ± 0.82,25.51,6.20,14.28,693.85
+pvt,baseline_upernet,polyp_kvasir,5,91.00 ± 0.86,85.60 ± 1.10,-,-,25.51,6.20,14.13,693.85
+pvt,baseline_upernet,tn3k,5,84.22 ± 0.32,76.24 ± 0.37,-,-,25.51,6.20,14.25,693.85
+resnet,baseline_linear_mlp,busi,5,79.80 ± 0.41,69.72 ± 0.51,-,-,23.75,5.50,5.90,644.96
+resnet,baseline_linear_mlp,isic2018,5,89.09 ± 0.14,81.71 ± 0.17,90.78 ± 0.09,83.74 ± 0.11,23.75,5.50,4.92,644.96
+resnet,baseline_linear_mlp,polyp_kvasir,5,87.77 ± 0.21,80.76 ± 0.35,-,-,23.75,5.50,5.98,644.96
+resnet,baseline_linear_mlp,tn3k,5,79.15 ± 0.24,69.75 ± 0.31,-,-,23.75,5.50,6.00,644.96
+resnet,baseline_semantic_fpn,busi,5,81.58 ± 0.56,72.50 ± 0.87,-,-,24.09,5.83,6.77,649.53
+resnet,baseline_semantic_fpn,isic2018,5,89.74 ± 0.13,82.76 ± 0.20,91.11 ± 0.44,84.40 ± 0.74,24.09,5.83,6.82,649.53
+resnet,baseline_semantic_fpn,polyp_kvasir,5,87.77 ± 0.51,81.41 ± 0.62,-,-,24.09,5.83,6.68,649.53
+resnet,baseline_semantic_fpn,tn3k,5,81.22 ± 0.22,72.42 ± 0.29,-,-,24.09,5.83,6.75,649.53
+resnet,baseline_unet,busi,5,80.48 ± 0.93,71.11 ± 1.16,-,-,32.62,15.57,13.31,826.81
+resnet,baseline_unet,isic2018,5,89.85 ± 0.18,82.94 ± 0.23,91.09 ± 0.39,84.34 ± 0.60,32.62,15.57,13.36,826.81
+resnet,baseline_unet,polyp_kvasir,5,89.49 ± 0.43,83.24 ± 0.50,-,-,32.62,15.57,3.13,826.81
+resnet,baseline_unet,tn3k,5,81.55 ± 0.32,72.88 ± 0.45,-,-,32.62,15.57,3.12,826.81
+resnet,baseline_upernet,busi,5,81.34 ± 0.78,72.16 ± 0.88,-,-,25.23,6.38,7.21,671.45
+resnet,baseline_upernet,isic2018,5,89.60 ± 0.20,82.57 ± 0.23,90.95 ± 0.69,84.25 ± 1.12,25.23,6.38,7.24,671.45
+resnet,baseline_upernet,polyp_kvasir,5,88.36 ± 0.46,81.95 ± 0.52,-,-,25.23,6.38,8.56,671.45
+resnet,baseline_upernet,tn3k,5,81.05 ± 0.34,72.24 ± 0.37,-,-,25.23,6.38,7.20,671.45
+swin,baseline_linear_mlp,busi,5,81.02 ± 0.67,71.81 ± 0.94,-,-,27.61,7.42,11.27,739.97
+swin,baseline_linear_mlp,isic2018,5,90.11 ± 0.15,83.39 ± 0.21,91.02 ± 0.46,84.16 ± 0.75,27.61,7.42,11.38,739.97
+swin,baseline_linear_mlp,polyp_kvasir,5,90.79 ± 0.45,84.98 ± 0.58,-,-,27.61,7.42,10.12,739.97
+swin,baseline_linear_mlp,tn3k,5,82.55 ± 0.35,73.88 ± 0.44,-,-,27.61,7.42,10.89,739.97
+swin,baseline_semantic_fpn,busi,5,81.20 ± 0.61,72.51 ± 0.53,-,-,27.94,7.76,12.18,748.10
+swin,baseline_semantic_fpn,isic2018,5,90.10 ± 0.25,83.50 ± 0.33,90.90 ± 0.67,84.01 ± 1.12,27.94,7.76,12.52,748.10
+swin,baseline_semantic_fpn,polyp_kvasir,5,90.91 ± 1.04,85.54 ± 1.43,-,-,27.94,7.76,12.01,748.10
+swin,baseline_semantic_fpn,tn3k,5,83.34 ± 0.35,75.25 ± 0.32,-,-,27.94,7.76,12.12,748.10
+swin,baseline_unet,busi,5,81.11 ± 0.68,72.18 ± 0.89,-,-,31.74,15.68,4.52,744.22
+swin,baseline_unet,isic2018,5,90.06 ± 0.25,83.39 ± 0.38,91.05 ± 0.90,84.27 ± 1.50,31.74,15.68,4.52,744.22
+swin,baseline_unet,polyp_kvasir,5,91.13 ± 0.80,85.78 ± 0.98,-,-,31.74,15.68,4.60,744.22
+swin,baseline_unet,tn3k,5,83.07 ± 0.24,74.87 ± 0.34,-,-,31.74,15.68,4.55,744.22
+swin,baseline_upernet,busi,5,81.80 ± 0.77,72.73 ± 1.32,-,-,28.35,8.26,12.55,755.06
+swin,baseline_upernet,isic2018,5,90.30 ± 0.12,83.71 ± 0.19,91.25 ± 0.47,84.55 ± 0.75,28.35,8.26,12.49,754.13
+swin,baseline_upernet,polyp_kvasir,5,90.66 ± 0.69,85.30 ± 0.90,-,-,28.35,8.26,12.08,755.83
+swin,baseline_upernet,tn3k,5,83.10 ± 0.42,74.89 ± 0.49,-,-,28.35,8.26,11.37,754.13
+vmamba,baseline_linear_mlp,busi,5,81.79 ± 0.54,73.30 ± 0.59,-,-,29.57,6.38,12.89,770.03
+vmamba,baseline_linear_mlp,isic2018,5,90.20 ± 0.23,83.53 ± 0.34,91.40 ± 0.59,84.87 ± 0.95,29.57,6.38,12.88,769.73
+vmamba,baseline_linear_mlp,polyp_kvasir,5,91.73 ± 0.15,86.43 ± 0.15,-,-,29.57,6.38,12.89,768.85
+vmamba,baseline_linear_mlp,tn3k,5,83.24 ± 0.22,75.18 ± 0.25,-,-,29.57,6.38,12.89,769.73
+vmamba,baseline_semantic_fpn,busi,5,82.08 ± 0.66,73.31 ± 0.89,-,-,29.91,6.72,14.20,772.81
+vmamba,baseline_semantic_fpn,isic2018,5,90.20 ± 0.20,83.51 ± 0.25,91.29 ± 0.21,84.66 ± 0.39,29.91,6.72,11.07,772.81
+vmamba,baseline_semantic_fpn,polyp_kvasir,5,91.66 ± 0.20,86.52 ± 0.23,-,-,29.91,6.72,14.24,772.55
+vmamba,baseline_semantic_fpn,tn3k,5,83.97 ± 0.22,75.96 ± 0.30,-,-,29.91,6.72,14.23,772.81
+vmamba,baseline_unet,busi,5,81.81 ± 0.51,73.34 ± 0.66,-,-,33.71,14.64,23.51,853.53
+vmamba,baseline_unet,isic2018,5,90.14 ± 0.16,83.43 ± 0.20,91.07 ± 0.26,84.31 ± 0.41,33.71,14.64,10.61,853.53
+vmamba,baseline_unet,polyp_kvasir,5,91.26 ± 0.69,85.91 ± 1.00,-,-,33.71,14.64,23.77,853.53
+vmamba,baseline_unet,tn3k,5,83.37 ± 0.38,75.36 ± 0.50,-,-,33.71,14.64,24.22,853.53
+vmamba,baseline_upernet,busi,5,82.52 ± 0.77,74.13 ± 1.04,-,-,30.31,7.21,14.16,780.87
+vmamba,baseline_upernet,isic2018,5,89.98 ± 0.17,83.26 ± 0.19,91.52 ± 0.48,85.06 ± 0.81,30.31,7.21,14.33,780.87
+vmamba,baseline_upernet,polyp_kvasir,5,91.16 ± 0.74,85.91 ± 1.07,-,-,30.31,7.21,10.65,782.34
+vmamba,baseline_upernet,tn3k,5,83.65 ± 0.37,75.67 ± 0.37,-,-,30.31,7.21,14.16,780.87
