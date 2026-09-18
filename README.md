@@ -1,22 +1,25 @@
-# P2SDiff — Boundary-Point Diffusion for Segmentation (V6)
+# P2SDiff — Boundary-Point Diffusion for Segmentation (V5)
 
-A clean, self-contained implementation of **segmentation-as-boundary-point-generation**.
+**Segmentation as boundary-point generation.**
 
 Instead of denoising per-pixel intensities, the diffusion process runs on the **2D coordinates of `N` ordered boundary points**; the denoised polygon is rasterized into a binary mask and scored with Dice / IoU.
 
-This package is independent of the older `scr/` code — nothing here imports from it.
+## Architecture
+
+<p align="center">
+  <img src="assets/model_architecture.png" width="70%" />
+</p>
 
 ## Sampling process
 
 Two examples of the DDIM denoising trajectory, from pure noise to the final
-contour (see `--gif` under "Useful flags" for how to generate these
+contour (see `--gif` under "Example runs" for how to generate these
 yourself):
 
 <p align="center">
   <img src="assets/sampling_example_1.gif" width="25%" />
   <img src="assets/sampling_example_2.gif" width="25%" />
 </p>
-
 
 ## Idea
 
@@ -44,7 +47,7 @@ image ─► backbone ─► multi-scale feature pyramid
                    ├── per-point sampler (input / deformable / attention)
                    │   reads finer pyramid scales, time-gated
                    │
-                   └── optional (V5) global cross-attention branch
+                   └── optional global cross-attention branch
                        reads pooled coarsest scales instead —
                        lets local sampler drop those scales
                        (`--local_drop_coarsest`)
@@ -69,7 +72,7 @@ refining detail near each point), and **boundary** (`BoundarySnapper`,
 pixel-precise correction after/during sampling). Each is trained for its
 own sub-task rather than one network doing everything.
 
-## Global cross-attention & scale dropping (V5)
+## Global cross-attention & scale dropping
 
 The local sampler is inherently local: every read happens at or near the
 point's own position, so it has no way to fix a badly mislocalized point.
@@ -84,7 +87,7 @@ no longer needs the coarsest scales itself: `--local_drop_coarsest N`
 removes the coarsest `N` scales from the local sampler's pyramid only — the
 global branch still always sees the full pyramid.
 
-## Hybrid boundary snapping (V5)
+## Hybrid boundary snapping
 
 `--snap_mode both` runs the `BoundarySnapper` twice: in-loop, on the last
 `--snap_t_threshold_frac` fraction of DDIM steps, correcting intermediate

@@ -390,15 +390,17 @@ def _bin_labels(n_bins):
 
 def main():
     parser = argparse.ArgumentParser(description="Train P2SDiff")
-    parser.add_argument("--dataset", choices=["ph2", "isic2017", "isic2018", "busi", "polyp"])
+    parser.add_argument("--dataset", choices=[  "ph2", "isic2017", "isic2018", "ham10000", "busi", "tn3k",
+                                                "polyp_clinicdb", "polyp_kvasir", "polyp_colondb", "polyp_etis", "polyp_cvc300"], required=True)
     parser.add_argument("--skin_root", type=str)
     parser.add_argument("--out_dir", type=str)
+    parser.add_argument("--img_size", type=lambda x: tuple(map(int, x.split(","))), default=(224, 224))
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--batch_size", type=int)
     parser.add_argument("--lr", type=float)
     parser.add_argument("--weight_decay", type=float)
     parser.add_argument("--n_points", type=int)
-    parser.add_argument("--encoder", choices=["convnext", "convnext_unet", "pvt", "unet", "convnext_slim_unet", "lastVit"])
+    parser.add_argument("--encoder", choices=["convnext", "pvt", "resnet", "swin", "vmamba"], default="convnext")
     parser.add_argument("--backbone", type=str)
     parser.add_argument("--freeze_backbone", type=str2bool, default=None)
     parser.add_argument("--backbone_lr", type=float)
