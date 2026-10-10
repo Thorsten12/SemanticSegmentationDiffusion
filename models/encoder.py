@@ -149,7 +149,7 @@ class ResNetConditioner(_PretrainedPyramid):
             pretrained=False,
             # checkpoint_path entfernt, um den fehlerhaften Auto-Load zu umgehen
             features_only=True,
-            # KORREKTUR: 1=layer1(256), 2=layer2(512), 3=layer3(1024), 4=layer4(2048)
+            # 1=layer1(256), 2=layer2(512), 3=layer3(1024), 4=layer4(2048)
             out_indices=(1, 2, 3, 4), 
         )
 
@@ -192,7 +192,7 @@ class SwinConditioner(_PretrainedPyramid):
             raise ValueError(f"Unknown Swin backbone '{backbone}'")
 
         import timm 
-        # 1. Modell instanziieren, OHNE den checkpoint_path direkt zu übergeben
+       
         self.backbone = timm.create_model(
             backbone,
             pretrained=False, 
@@ -202,28 +202,27 @@ class SwinConditioner(_PretrainedPyramid):
             dynamic_img_size=True
         )
 
-        # 2. Checkpoint manuell in den Arbeitsspeicher laden
+        
         state_dict = torch.load(checkpoint_path, map_location="cpu")
-        # Offizielle Checkpoints verstecken die Parameter oft in einem "model"-Schlüssel
+       
         if "model" in state_dict:
             state_dict = state_dict["model"]
 
-        # 3. Mapping der Parameter-Namen durchführen
+       
         mapped_state_dict = {}
         for k, v in state_dict.items():
             if "downsample" in k:
-                # Verschiebt den Index für Downsampling um +1 (layers.0 -> layers_1)
+                
                 new_k = re.sub(r"^layers\.(\d+)\.downsample", 
                                lambda m: f"layers_{int(m.group(1)) + 1}.downsample", k)
             else:
-                # Standard-Mapping für Attention-Blocks und andere Layer
+                
                 new_k = re.sub(r"^layers\.(\d+)\.", r"layers_\1.", k)
             
             mapped_state_dict[new_k] = v
 
-        # 4. Angepasstes Dictionary laden
-        # strict=False ist notwendig, da features_only=True den Classification-Head 
-        # des Modells entfernt, dieser aber noch in den Gewichten existiert.
+        
+        
         self.backbone.load_state_dict(mapped_state_dict, strict=False)
 
         self.feature_channels = list(self.backbone.feature_info.channels())

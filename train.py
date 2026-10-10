@@ -3,8 +3,11 @@
 Run from the repository root:
     python -m src.train --dataset isic2017 --epochs 100 --batch_size 16
 
-Saves EMA checkpoints + a loss curve + periodic validation visualizations under
-`cfg.out_dir`.
+Training jointly optimizes the encoder, the contour denoiser, the boundary
+snapper and (optionally) the coarse-contour proposal head. EMA checkpoints, a
+loss curve, scale-gate statistics and periodic validation visualizations are
+saved under `cfg.out_dir`. After training, the best checkpoint is evaluated on
+the test split and per-component complexity statistics are recorded.
 """
 
 import argparse
@@ -30,6 +33,7 @@ from .diffusion import GaussianDiffusion
 from .utils import EMA
 
 def str2bool(v):
+    """Parse a boolean CLI argument."""
     if isinstance(v, bool):
         return v
     v = str(v).lower()
@@ -40,7 +44,12 @@ def str2bool(v):
     raise argparse.ArgumentTypeError(f"Boolean expected, got {v!r}")
 
 def _current_onpolicy_weight(cfg, epoch_idx: int) -> float:
-    """epoch_idx ist 0-basiert (epoch in der Trainingsschleife, VOR +1)."""
+    """Weight of the on-policy snapper loss at a given epoch.
+
+    The weight is 0 during the warmup epochs, then ramps linearly to
+    `lambda_snap_onpolicy` over `snap_onpolicy_ramp_epochs` (immediately if the
+    ramp is 0). `epoch_idx` is 0-based.
+    """
     if cfg.lambda_snap_onpolicy <= 0:
         return 0.0
     warmup = max(int(cfg.snap_onpolicy_warmup_epochs), 0)
@@ -54,16 +63,12 @@ def _current_onpolicy_weight(cfg, epoch_idx: int) -> float:
 
 
 def _resolve_residual_target(cfg: Config) -> str:
-    """Decide what the denoiser's zero-initialized head output should mean.
+    """Decide what the denoiser's zero-initialized head output represents.
 
-    V5 fix: when a deterministic proposal supplies the global initial guess
-    (`proposal_target == "residual"`), the denoiser must predict a pure
-    delta that is exactly 0 at init -- NOT a residual on the ~N(0,1)-scale
-    noisy diffusion input.
-
-    "input"  : legacy behavior, no proposal in play.
-    "zero"   : proposal supplies the initial guess; denoiser predicts the
-               local correction on top of it.
+    "zero":  a proposal supplies the initial guess; the denoiser predicts the
+             local correction on top of it.
+    "input": the denoiser predicts a residual on its noisy input (no proposal).
+    "none":  direct prediction, no residual.
     """
     if cfg.proposal_target == "residual":
         return "zero"
@@ -71,6 +76,7 @@ def _resolve_residual_target(cfg: Config) -> str:
 
 
 def build_models(cfg: Config, device):
+    """Instantiate encoder, denoiser, snapper and (optionally) the proposal head."""
     encoder = build_conditioner(cfg).to(device)
     residual_target = _resolve_residual_target(cfg)
     print("n_points", cfg.n_points, "hidden_dim", cfg.hidden_dim,
@@ -138,6 +144,7 @@ def build_models(cfg: Config, device):
         use_rgb=cfg.snap_use_rgb,
     ).to(device)
 
+    # The proposal head operates on the coarsest backbone features.
     proposal_head = None
     if cfg.proposal_target != "absolute":
         coarsest_channels = encoder.feature_channels[-1]
@@ -160,7 +167,7 @@ def build_models(cfg: Config, device):
 
 
 def _load_init_checkpoint(path, encoder, denoiser, snapper, device, proposal_head=None):
-    """Load matching EMA weights for transfer; skip mismatched keys."""
+    """Warm-start from a checkpoint (EMA weights); mismatched keys are skipped."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
     for name, module in (("encoder", encoder), ("denoiser", denoiser), ("snapper", snapper)):
         if name not in ckpt:
@@ -175,9 +182,16 @@ def _load_init_checkpoint(path, encoder, denoiser, snapper, device, proposal_hea
         else:
             print(f"  warn: no 'proposal_head' in {path} -- using freshly-initialized proposal head")
 
+
+# --------------------------------------------------------------------------
+# Model complexity profiling
+# --------------------------------------------------------------------------
+# The wrappers below expose each component as a plain nn.Module with
+# positional tensor inputs, so that hook-based FLOP counters (fvcore) see the
+# real submodule tree.
+
 class _EncoderExtractWrapper(nn.Module):
-    """Thin nn.Module wrapper so fvcore's hook-based FlopCountAnalysis sees
-    a real module tree (encoder's own submodules) instead of a lambda."""
+    """Wraps `encoder.extract` as a module."""
     def __init__(self, encoder):
         super().__init__()
         self.encoder = encoder
@@ -187,17 +201,19 @@ class _EncoderExtractWrapper(nn.Module):
 
 
 class _DenoiserCallWrapper(nn.Module):
+    """Wraps the denoiser call; condition maps are passed as *args."""
     def __init__(self, denoiser):
         super().__init__()
         self.denoiser = denoiser
 
     def forward(self, points, t, *cond_maps):
-        # cond_maps passed as *args (not a list) so fvcore's tracer, which
-        # inspects positional args, sees each map as its own tensor input.
+        # Each map is a separate positional tensor so fvcore's tracer sees it
+        # as its own input.
         return self.denoiser(points, t, list(cond_maps), return_scale_weights=False)
 
 
 class _SnapperCallWrapper(nn.Module):
+    """Wraps the snapper call (raw maps as *args, no RGB input)."""
     def __init__(self, snapper):
         super().__init__()
         self.snapper = snapper
@@ -207,9 +223,13 @@ class _SnapperCallWrapper(nn.Module):
 
 
 def compute_model_stats(module, device, n_warmup=5, n_timed=20, dummy_inputs=None):
-    """Generic params/FLOPs/latency/memory profiler for a real nn.Module
-    (use the wrapper classes above for encoder.extract / denoiser / snapper
-    so fvcore's hooks see actual submodules, not a lambda closure)."""
+    """Profile parameters, FLOPs, latency and peak GPU memory of a module.
+
+    FLOPs are counted with fvcore if available, otherwise with thop (MACs * 2).
+    Latency is the mean over `n_timed` forward passes after `n_warmup` warmup
+    passes. Peak memory is measured on CUDA only. Failures in individual
+    measurements are recorded in the returned dict instead of raised.
+    """
     stats = {}
     n_total = sum(p.numel() for p in module.parameters())
     n_trainable = sum(p.numel() for p in module.parameters() if p.requires_grad)
@@ -220,6 +240,7 @@ def compute_model_stats(module, device, n_warmup=5, n_timed=20, dummy_inputs=Non
 
     module.eval()
 
+    # FLOPs.
     stats["flops"] = None
     stats["flops_G"] = None
     stats["flops_source"] = None
@@ -248,6 +269,7 @@ def compute_model_stats(module, device, n_warmup=5, n_timed=20, dummy_inputs=Non
     else:
         stats["flops_source"] = "skipped (no dummy_inputs provided)"
 
+    # Latency.
     stats["latency_ms_per_call"] = None
     if dummy_inputs is not None:
         try:
@@ -267,6 +289,7 @@ def compute_model_stats(module, device, n_warmup=5, n_timed=20, dummy_inputs=Non
         except Exception as e:
             stats["latency_error"] = str(e)
 
+    # Peak memory.
     stats["peak_memory_MB"] = None
     if device.type == "cuda" and dummy_inputs is not None:
         try:
@@ -283,15 +306,12 @@ def compute_model_stats(module, device, n_warmup=5, n_timed=20, dummy_inputs=Non
 
 
 def compute_p2sdiff_model_stats(encoder, denoiser, snapper, cfg, device):
-    """Per-component stats (encoder/denoiser/snapper), same shape as
-    baseline_seg.compute_model_stats. Each component is wrapped in a thin
-    nn.Module (see wrapper classes above) so fvcore's FlopCountAnalysis
-    hooks see the real submodule tree instead of a lambda closure.
+    """Per-component complexity statistics (encoder, denoiser, snapper) and totals.
 
-    Note: encoder.fuse(raw, t) (needed to build cond_maps for the denoiser
-    dummy input) is NOT separately timed/counted here -- its cost is
-    excluded from all three component numbers. Say the word if you want it
-    as a fourth category.
+    Measured on a single dummy sample at t = 0 with the configured image size.
+    Totals sum parameters, FLOPs and latency across components (None if any
+    component lacks the value) and take the maximum for peak memory. The output
+    format matches `baseline_seg.compute_model_stats`.
     """
     b = 1
     img_size = cfg.img_size
@@ -351,7 +371,7 @@ def compute_p2sdiff_model_stats(encoder, denoiser, snapper, cfg, device):
 
 
 class WarmupCosineScheduler:
-    """Linear warmup then cosine decay to min_lr (per-epoch steps)."""
+    """Per-epoch learning-rate schedule: linear warmup, then cosine decay to `min_lr`."""
 
     def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr):
         self.optimizer = optimizer
@@ -379,6 +399,7 @@ class WarmupCosineScheduler:
         return [g["lr"] for g in self.optimizer.param_groups]
 
 
+# Scale-gate statistics are aggregated over this many equally sized timestep bins.
 N_GATE_BINS = 3
 
 
@@ -390,6 +411,8 @@ def _bin_labels(n_bins):
 
 def main():
     parser = argparse.ArgumentParser(description="Train P2SDiff")
+
+    # ----- data and optimization -----
     parser.add_argument("--dataset", choices=[  "ph2", "isic2017", "isic2018", "ham10000", "busi", "tn3k",
                                                 "polyp_clinicdb", "polyp_kvasir", "polyp_colondb", "polyp_etis", "polyp_cvc300"], required=True)
     parser.add_argument("--skin_root", type=str)
@@ -438,7 +461,7 @@ def main():
     parser.add_argument("--lambda_nearest", type=float, default=1.0)
     parser.add_argument("--nearest_gamma", type=float, default=1.0)
 
-    # ----- boundary snapper CLI args -----
+    # ----- boundary snapper -----
     parser.add_argument("--lambda_snap", type=float, default=1.0)
     parser.add_argument("--snap_n_samples", type=int, default=11)
     parser.add_argument("--snap_radius", type=float, default=0.10)
@@ -459,11 +482,13 @@ def main():
                              "own gated correction. 0.0 (default) keeps the old behavior.")
     parser.add_argument("--snap_biou_size", type=int, default=64)
 
+    # Snapper usage at inference: post-hoc ("post"), inside the DDIM loop
+    # ("loop"), both, or disabled.
     parser.add_argument("--snap_mode", choices=["post", "loop", "both", "none"], default="post")
     parser.add_argument("--snap_t_threshold_frac", type=float, default=0.15)
     parser.add_argument("--snap_every", type=int, default=1)
 
-    # ----- V5/V6: deterministic coarse-contour proposal CLI args -----
+    # ----- coarse-contour proposal -----
     parser.add_argument("--proposal_target", choices=["absolute", "residual"], default="residual")
     parser.add_argument("--proposal_type", choices=["fourier", "ellipse"], default="fourier")
     parser.add_argument("--proposal_n_shapes", type=int, default=1)
@@ -476,110 +501,33 @@ def main():
     parser.add_argument("--gif", action="store_true")
     parser.add_argument("--gif_steps", type=int, default=10)
 
-    # ----- NEW (V7 Ablation A): t-abhaengige Daempfung der Multi-Scale-Guidance -----
-    parser.add_argument("--guidance_time_scale", type=float, default=0.0,
-                    help="Ablation: daempft die Multi-Scale-Guidance-Amplitude "
-                         "linear mit t (0.0=aus/Default, identisch zum alten "
-                         "Verhalten; 1.0=volle Daempfung auf 0 bei t=T). Soll "
-                         "verhindern, dass der Denoiser bei hohem t komplett "
-                         "auf der Bildkonditionierung 'ausruht' statt auf den "
-                         "echten Diffusionszustand zu reagieren -- siehe "
-                         "sensitivity_debug.py fuer die Diagnose, die das motiviert.")
+    # ----- timestep-dependent damping of the multi-scale guidance -----
+    parser.add_argument("--guidance_time_scale", type=float, default=0.0)
 
-    # ----- NEW (V7 Ablation B): Sensitivitaets-Regularisierung -----
-    parser.add_argument("--lambda_sensitivity", type=float, default=0.0,
-                    help="Ablation: Gewicht fuer einen Sensitivitaets-Loss, der "
-                         "bestraft, wenn pred_x0 bei UNTERSCHIEDLICHEN Rausch-"
-                         "Samples (gleiches x0/t/Bild) zu AEHNLICH ausfaellt. "
-                         "0.0 (Default) = aus, exakt altes Verhalten, kein "
-                         "zusaetzlicher Forward-Pass. >0 kostet einen zweiten "
-                         "Denoiser-Forward-Pass pro Trainingsschritt. Siehe "
-                         "sensitivity_debug.py fuer die Diagnose, die das motiviert.")
-    parser.add_argument("--sensitivity_min_ratio", type=float, default=0.15,
-                        help="Ziel-Mindestverhaeltnis pred_diff/input_diff fuer "
-                             "--lambda_sensitivity > 0. Kalibrieren anhand der "
-                             "von sensitivity_debug.py gemessenen Ist-Werte.")
+    # ----- sensitivity regularization -----
+    parser.add_argument("--lambda_sensitivity", type=float, default=0.0)
+    parser.add_argument("--sensitivity_min_ratio", type=float, default=0.15)
 
-    # ----- V8: multi-scale sampling strategy (mutually exclusive, see denoiser.py) -----
-    parser.add_argument("--sampler_type", choices=["input", "deformable", "attention"], default=None,
-                        help="Welche Aggregations-Strategie der multi-scale point sampler "
-                             "verwendet. 'input' (Default in Config) = alter "
-                             "MultiScalePointSampler (1 aligned grid_sample/Skala). "
-                             "'deformable' = DeformableScalePointSampler (gelernte "
-                             "Offsets + token-blinde Softmax-Fusion). 'attention' = "
-                             "AttentionScalePointSampler (feste lokale Nachbarschaft + "
-                             "echte content-basierte Scaled-Dot-Product-Attention). "
-                             "Ersetzt das aeltere --use_deformable_sampling (weiterhin "
-                             "unten vorhanden, fuer Rueckwaertskompatibilitaet mit alten "
-                             "Configs/Skripten -- wird nur beachtet, wenn --sampler_type "
-                             "NICHT gesetzt ist).")
-    parser.add_argument("--use_deformable_sampling", type=str2bool, default=None,
-                        help="DEPRECATED, siehe --sampler_type. Nur noch aus "
-                             "Rueckwaertskompatibilitaet vorhanden: wird ignoriert, "
-                             "sobald --sampler_type explizit gesetzt ist.")
-    parser.add_argument("--deform_n_samples", type=int, default=None,
-                        help="Anzahl Kandidaten/Reads pro Punkt und Skala. Gilt fuer "
-                             "sampler_type=deformable UND sampler_type=attention "
-                             "(gleiches K fuer fairen Vergleich).")
-    parser.add_argument("--deform_min_scale_res", type=int, default=None,
-                        help="Skalen mit Aufloesung >= diesem Wert bekommen multi-"
-                             "sample Reads (deformable ODER attention); darunter "
-                             "bleibt es beim alten einzelnen aligned grid_sample. "
-                             "Gilt fuer beide neuen sampler_type-Werte.")
-    parser.add_argument("--deform_radius_cells", type=float, default=None,
-                        help="(nur sampler_type=deformable) Suchradius fuer die "
-                             "gelernten Offsets, in 'Grid-Zellen' der jeweiligen "
-                             "Skalen-Aufloesung.")
-    parser.add_argument("--attn_sampler_window", type=int, default=None,
-                        help="(nur sampler_type=attention) Seitenlaenge des festen "
-                             "lokalen Kandidaten-Grids (z.B. 5 -> 5x5=25 Kandidaten, "
-                             "davon werden die deform_n_samples zentrumsnaechsten "
-                             "behalten). Muss attn_sampler_window^2 >= deform_n_samples "
-                             "erfuellen.")
-    parser.add_argument("--attn_sampler_heads", type=int, default=None,
-                        help="(nur sampler_type=attention) Anzahl Attention-Heads. "
-                             "Muss cond_channels (=proj_dim des Samplers) teilen.")
+    # ----- multi-scale sampling strategy (mutually exclusive; see denoiser.py) -----
+    parser.add_argument("--sampler_type", choices=["input", "deformable", "attention"], default=None)
+    parser.add_argument("--use_deformable_sampling", type=str2bool, default=None)
+    parser.add_argument("--deform_n_samples", type=int, default=None)
+    parser.add_argument("--deform_min_scale_res", type=int, default=None)
+    parser.add_argument("--deform_radius_cells", type=float, default=None)
+    parser.add_argument("--attn_sampler_window", type=int, default=None)
+    parser.add_argument("--attn_sampler_heads", type=int, default=None)
 
     parser.add_argument("--lambda_curvature", type=float, default=0.0)
     parser.add_argument("--curvature_gamma", type=float, default=1.0)
-    parser.add_argument("--top_k_scales", type=int, default=None,
-                        help="Falls gesetzt (<n_scales): pro Sample werden nur die "
-                             "top_k_scales staerksten Scale-Gate-Gewichte behalten, "
-                             "der Rest wird auf 0 maskiert (kein Compute-Skip -- alle "
-                             "Scales werden weiterhin voll durchgerechnet, nur ihr "
-                             "Beitrag zum finalen guidance-Vektor wird fuer die "
-                             "schwaechsten Scales stillgelegt). Reduziert die effektive "
-                             "Informationsmenge pro Zeitschritt. None (Default) = aus, "
-                             "identisch zum alten Verhalten.")
-    # ===== CLI-Argumente (bei den anderen --snap_* Args einfügen) =====
-    parser.add_argument("--lambda_snap_onpolicy", type=float, default=0.0,
-                        help="Zusaetzliches on-policy Snapper-Training auf echten "
-                             "(detachten) Diffusions-Outputs (pred_x0), nicht nur auf "
-                             "synthetisch GT-perturbierten Konturen. 0.0 (Default) = aus, "
-                             "identisches Verhalten wie zuvor. Nur wirksam wenn "
-                             "cfg.snap_mode in ('loop','both') UND lambda_snap > 0, "
-                             "da der on-policy Loss das Loop/Post-Verhalten bei Inferenz "
-                             "abdecken soll.")
-    parser.add_argument("--snap_onpolicy_warmup_epochs", type=int, default=10,
-                        help="Anzahl Epochen, bevor der on-policy Snapper-Loss aktiviert "
-                             "wird. pred_x0 ist frueh im Training oft weit von GT entfernt "
-                             "-- ohne Warmup wuerde der Confidence-Kopf lernen, dort "
-                             "permanent 'unsicher' zu sein (siehe exact_boundary.py "
-                             "Docstring fuer dasselbe Argument bei V5.2's Design-"
-                             "Entscheidung, NICHT on-policy zu trainieren). Waehrend der "
-                             "Warmup-Phase laeuft nur der bestehende Teacher-Loss.")
-    parser.add_argument("--snap_onpolicy_ramp_epochs", type=int, default=10,
-                        help="Nach dem Warmup wird lambda_snap_onpolicy linear ueber "
-                             "diese Anzahl Epochen von 0 auf den vollen Wert hochgefahren, "
-                             "statt abrupt einzuschalten. 0 = kein Ramp, sofort voll nach "
-                             "dem Warmup.")
+    parser.add_argument("--top_k_scales", type=int, default=None)
 
-    parser.add_argument("--use_global_attn", type=str2bool, default=False,
-                    help="Aktiviert einen zusaetzlichen globalen Cross-Attention-"
-                         "Zweig (V5.2-Stil) auf einem kompakten, raeumlich "
-                         "getaggten Memory aus den groebsten Encoder-Skalen. "
-                         "Zeitgegatet (stark bei hohem t). Zero-init, startet "
-                         "als No-Op. False (Default) = aus, altes Verhalten.")
+    # ----- on-policy snapper loss (trained on the denoiser's own predictions) -----
+    parser.add_argument("--lambda_snap_onpolicy", type=float, default=0.0)
+    parser.add_argument("--snap_onpolicy_warmup_epochs", type=int, default=10)
+    parser.add_argument("--snap_onpolicy_ramp_epochs", type=int, default=10)
+
+    # ----- global attention -----
+    parser.add_argument("--use_global_attn", type=str2bool, default=False)
     parser.add_argument("--global_attn_levels", type=int, default=2)
     parser.add_argument("--global_attn_grid", type=int, default=14)
 
@@ -589,12 +537,7 @@ def main():
     parser.add_argument("--global_attn_gate_min", type=float, default=None)
     parser.add_argument("--global_attn_gate_max", type=float, default=None)
 
-    parser.add_argument("--local_drop_coarsest", type=int, default=None,
-                        help="Entfernt die groebsten N Skalen aus dem Input des "
-                             "lokalen Samplers (input/deformable/attention). Der "
-                             "globale Cross-Attention-Zweig (falls aktiv) sieht "
-                             "weiterhin die volle Pyramide. 0 (Default) = aus, "
-                             "identisch zum alten Verhalten.")
+    parser.add_argument("--local_drop_coarsest", type=int, default=None)
 
     args = parser.parse_args()
 
@@ -602,11 +545,7 @@ def main():
     if args.no_amp:
         cfg.amp = False
 
-    # Backward compat: alte Configs/Skripte setzen nur --use_deformable_sampling
-    # und kennen --sampler_type noch nicht. Config.from_args() hat oben bereits
-    # BEIDE Felder unabhaengig voneinander aus args uebernommen (falls gesetzt);
-    # hier wird nur noch das PRIORITAETS-Verhaeltnis zwischen ihnen aufgeloest,
-    # falls der Aufrufer inkonsistent beides oder nur das alte Flag gesetzt hat.
+    # Legacy flag: map the boolean deformable switch onto `sampler_type`.
     if args.sampler_type is None and args.use_deformable_sampling is not None:
         cfg.sampler_type = "deformable" if args.use_deformable_sampling else "input"
 
@@ -623,6 +562,7 @@ def main():
     with open(os.path.join(cfg.out_dir, "config.json"), "w") as f:
         json.dump({k: getattr(cfg, k) for k in cfg.__dataclass_fields__}, f, indent=2, default=str)
 
+    # ----- data -----
     counts = split_counts(cfg.skin_root, cfg.dataset, cfg.npy_size)
     print(f"Dataset {cfg.dataset} | split -> train {counts['tr']} | "
           f"val {counts['vl']} | test {counts['te']}")
@@ -638,6 +578,7 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False,
                             num_workers=cfg.num_workers, persistent_workers=persist)
 
+    # ----- models, EMA, optimizer -----
     encoder, denoiser, snapper, proposal_head = build_models(cfg, device)
     if cfg.init_checkpoint:
         print(f"Warm-start from {cfg.init_checkpoint}")
@@ -650,6 +591,7 @@ def main():
         ema_modules.append(proposal_head)
     ema = EMA(ema_modules, decay=cfg.ema_decay)
 
+    # Separate parameter groups: the backbone (if unfrozen) uses its own learning rate.
     backbone = getattr(encoder, "backbone", None)
     backbone_ids = {id(p) for p in backbone.parameters()} if backbone is not None else set()
     backbone_params, head_params = [], []
@@ -700,6 +642,7 @@ def main():
                 "snap_onpolicy_weight": []}
     best_val = -1.0
 
+    # ----- training loop -----
     for epoch in range(cfg.epochs):
         print(f"Positional scale: {denoiser.pos_scale.item()}")
 
@@ -716,10 +659,11 @@ def main():
         snap_conf_rate_running = 0.0
         snap_biou_running = 0.0
         proposal_dice_running = 0.0
-        sensitivity_running = 0.0  # NEW
+        sensitivity_running = 0.0
         snap_onpolicy_off_running = 0.0
         snap_onpolicy_conf_running = 0.0
 
+        # Accumulators for the mean scale-gate value per timestep bin.
         gate_sum = torch.zeros(N_GATE_BINS, n_scales, device=device)
         gate_cnt = torch.zeros(N_GATE_BINS, device=device)
 
@@ -736,6 +680,7 @@ def main():
             t = torch.randint(0, cfg.timesteps, (b,), device=device).long()
 
             with torch.amp.autocast("cuda", enabled=use_amp):
+                # Forward diffusion, feature extraction and coarse proposal.
                 noisy = diffusion.q_sample(points, t)
                 raw = encoder.extract(images)
                 proposal = proposal_head(raw) if proposal_head is not None else None
@@ -745,6 +690,7 @@ def main():
                 else:
                     loss_proposal_dice = torch.zeros((), device=device)
 
+                # Classifier-free guidance training: randomly drop the condition maps.
                 cond_maps = encoder.fuse(raw, t)
                 keep = (torch.rand(b, device=device) >= cfg.cfg_dropout)
                 keep = keep.to(cond_maps[0].dtype).view(b, 1, 1, 1)
@@ -753,14 +699,8 @@ def main():
                 pred_x0 = torch.clamp(pred_x0, -cfg.x0_clamp, cfg.x0_clamp)
                 pred_x0 = apply_proposal_target(pred_x0, proposal, cfg.proposal_target)
 
-                # ----- NEW (V7 Ablation B): optionale Sensitivitaets-Regularisierung -----
-                # Zweiter, unabhaengiger Rausch-Sample-Durchlauf bei GLEICHEM
-                # t und GLEICHEM cond_maps/proposal -- misst/bestraft, ob der
-                # Denoiser tatsaechlich auf den Diffusionszustand reagiert,
-                # statt nur auf die (identische) Bildkonditionierung
-                # "auszuruhen". Siehe sensitivity_debug.py fuer die Diagnose,
-                # die diesen Loss motiviert. Kostet einen zweiten Denoiser-
-                # Forward-Pass NUR wenn lambda_sensitivity > 0.
+                # Sensitivity regularization: a second prediction from the same
+                # x0 with independent noise.
                 if cfg.lambda_sensitivity > 0:
                     noise_b = torch.randn_like(points)
                     noisy_b = diffusion.q_sample(points, t, noise=noise_b)
@@ -775,6 +715,7 @@ def main():
                 else:
                     loss_sensitivity = torch.zeros((), device=device)
 
+                # Diffusion losses and auxiliary terms.
                 loss, parts = diffusion.training_losses(
                     pred_x0, points, t, masks=masks,
                     lambda_mse=cfg.lambda_mse,
@@ -783,11 +724,12 @@ def main():
                     lambda_dice=cfg.lambda_dice, snr_gamma=cfg.snr_gamma,
                     lambda_nearest=cfg.lambda_nearest, nearest_gamma=cfg.nearest_gamma,
                     biou_gamma=cfg.biou_gamma, lambda_biou=cfg.lambda_biou,     
-                    lambda_curvature=cfg.lambda_curvature, curvature_gamma=cfg.curvature_gamma,  # NEW
+                    lambda_curvature=cfg.lambda_curvature, curvature_gamma=cfg.curvature_gamma,
                     soft_dice_size=cfg.soft_dice_size)
                 loss = loss + cfg.lambda_proposal_dice * loss_proposal_dice
-                loss = loss + cfg.lambda_sensitivity * loss_sensitivity   # NEW
+                loss = loss + cfg.lambda_sensitivity * loss_sensitivity
 
+                # Snapper teacher loss (perturbed ground-truth contours).
                 if cfg.lambda_snap > 0:
                     snap_loss, snap_parts = snapper.teacher_loss(
                         points, raw, image=images,
@@ -807,6 +749,10 @@ def main():
                         "snap_teacher_conf_rate": torch.zeros((), device=device),
                         "snap_teacher_loss_biou": torch.zeros((), device=device),
                     }
+
+                # Snapper on-policy loss: same targets as the teacher loss, but on
+                # the denoiser's own (detached) x0 predictions. Active only after
+                # warmup, when snapping inside the sampling loop is used.
                 if onpolicy_active:
                     onpolicy_points = pred_x0.detach()
                     off_pred_op, conf_logit_op, normal_op = snapper._predict(
@@ -852,6 +798,7 @@ def main():
                     loss_off_op = torch.zeros((), device=device)
                     loss_conf_op = torch.zeros((), device=device)
 
+            # Optimization step and EMA update.
             scaler.scale(loss).backward()
             if cfg.grad_clip:
                 scaler.unscale_(optimizer)
@@ -866,10 +813,11 @@ def main():
             snap_conf_rate_running += snap_parts["snap_teacher_conf_rate"].item()
             snap_biou_running += snap_parts["snap_teacher_loss_biou"].item()
             proposal_dice_running += loss_proposal_dice.item()
-            sensitivity_running += loss_sensitivity.item()  # NEW
+            sensitivity_running += loss_sensitivity.item()
             snap_onpolicy_off_running += loss_off_op.item()
             snap_onpolicy_conf_running += loss_conf_op.item()
 
+            # Accumulate scale-gate statistics per timestep bin.
             with torch.no_grad():
                 bin_idx = (t.float() / cfg.timesteps * N_GATE_BINS).long().clamp(0, N_GATE_BINS - 1)
                 w = scale_w.detach().float()
@@ -889,7 +837,7 @@ def main():
                               "loss_nearest": f"{parts['loss_nearest'].item():.4f}",
                               "loss_curv": f"{parts['loss_curvature'].item():.4f}",
                               "prop_dice": f"{loss_proposal_dice.item():.4f}",
-                              "sens": f"{loss_sensitivity.item():.4f}",  # NEW
+                              "sens": f"{loss_sensitivity.item():.4f}",
                               "snap_off": f"{snap_parts['snap_teacher_loss_offset'].item():.4f}",
                               "snap_conf": f"{snap_parts['snap_teacher_loss_conf'].item():.4f}",
                               "snap_crate": f"{snap_parts['snap_teacher_conf_rate'].item():.3f}",
@@ -897,6 +845,7 @@ def main():
                               "gate": "/".join(f"{v:.2f}" for v in batch_mean_w.tolist()),
                               "lr": f"{cur_lr:.2e}"})
 
+        # ----- epoch logging -----
         avg = running / max(1, len(train_loader))
         n_batches = max(1, len(train_loader))
         history["epoch"].append(epoch + 1)
@@ -907,7 +856,7 @@ def main():
         history["snap_conf_rate"].append(snap_conf_rate_running / n_batches)
         history["snap_biou_loss"].append(snap_biou_running / n_batches)
         history["proposal_dice_loss"].append(proposal_dice_running / n_batches)
-        history["loss_sensitivity"].append(sensitivity_running / n_batches)  # NEW
+        history["loss_sensitivity"].append(sensitivity_running / n_batches)
         history["snap_onpolicy_offset_loss"].append(snap_onpolicy_off_running / n_batches)
         history["snap_onpolicy_conf_loss"].append(snap_onpolicy_conf_running / n_batches)
         history["snap_onpolicy_weight"].append(onpolicy_weight)
@@ -923,12 +872,13 @@ def main():
         print(f"Epoch {epoch+1} | train loss {avg:.4f} | lr {cur_lr:.2e}")
         print(f"Epoch {epoch+1} | scale-gate importance -> {gate_str}")
         print(f"Epoch {epoch+1} | proposal dice: {history['proposal_dice_loss'][-1]:.4f}")
-        print(f"Epoch {epoch+1} | sensitivity loss: {history['loss_sensitivity'][-1]:.4f}")  # NEW
+        print(f"Epoch {epoch+1} | sensitivity loss: {history['loss_sensitivity'][-1]:.4f}")
         print(f"Epoch {epoch+1} | snapper teacher: offset {history['snap_offset_loss'][-1]:.4f} "
               f"| conf {history['snap_conf_loss'][-1]:.4f} "
               f"| conf_rate {history['snap_conf_rate'][-1]:.3f} "
               f"| biou {history['snap_biou_loss'][-1]:.4f}")
 
+        # ----- validation (EMA weights) and best-checkpoint selection -----
         do_eval = (epoch + 1) % cfg.eval_every == 0 or (epoch + 1) == cfg.epochs
         if do_eval:
             from .sample import evaluate
@@ -962,6 +912,7 @@ def main():
                 torch.save(ckpt_out, os.path.join(cfg.out_dir, "best.pth"))
                 print(f"  -> new best (Dice {dice:.4f}) -> best.pth")
 
+        # Always save the latest EMA checkpoint and the training history.
         ema_mods = ema.modules
         ema_encoder, ema_denoiser, ema_snapper = ema_mods[0], ema_mods[1], ema_mods[2]
         ema_proposal_head = ema_mods[3] if proposal_head is not None else None
@@ -980,29 +931,18 @@ def main():
     _plot_history(history, os.path.join(cfg.out_dir, "loss_curve.png"))
     _plot_scale_gates(history, bin_labels, os.path.join(cfg.out_dir, "scale_gates.png"))
 
+    # ----- final test evaluation and complexity statistics (best checkpoint) -----
     best_path = os.path.join(cfg.out_dir, "best.pth")
     test_metrics = {}
-    model_stats = {}   # NEW: default -- bleibt leer, falls load_checkpoint/evaluate scheitert
+    model_stats = {}   # stays empty if checkpoint loading or evaluation fails
     if os.path.isfile(best_path):
         try:
             from .sample import evaluate, load_checkpoint
-            # Fresh Config(), let load_checkpoint do ALL config restoration
-            # itself (same whitelist logic used by
-            # `python -m x0_prediction_V6.sample --ckpt ...`), instead of
-            # separately pre-populating a cfg_eval here too -- avoids two
-            # slightly different restoration paths drifting out of sync
-            # (e.g. missing a new field like sampler_type/attn_sampler_*/
-            # top_k_scales -- make sure sample.py's load_checkpoint whitelist
-            # includes "top_k_scales" and passes it through to ContourDenoiser,
-            # or this will fail with a state_dict size mismatch on
-            # sampler.mlp.0.weight).
+
             cfg_eval = Config()
             enc_t, den_t, snap_t, prop_t = load_checkpoint(best_path, cfg_eval, device)
 
-            # dataset/img_size/n_points etc. are NOT part of load_checkpoint's
-            # restoration (it only restores model-architecture fields) --
-            # build the test set from THIS run's own cfg, matching what this
-            # run was actually trained/evaluated on throughout.
+
             test_ds = build_contour_dataset(cfg.skin_root, cfg.dataset, "te", cfg.n_points,
                                             cfg.img_size, augment=False, npy_size=cfg.npy_size)
             test_loader = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False,
@@ -1022,25 +962,17 @@ def main():
                 json.dump(test_metrics, f, indent=2)
             print(f"Test Dice {test_dice:.4f} | Test IoU {test_iou:.4f}")
 
-            # NEW: model_stats jetzt INNERHALB des try-Blocks -- enc_t/den_t/
-            # snap_t sind hier garantiert erfolgreich zugewiesen worden.
+
             print("Computing FLOPs / latency / memory stats (encoder/denoiser/snapper)...")
             model_stats = compute_p2sdiff_model_stats(enc_t, den_t, snap_t, cfg_eval, device)
         except Exception as e:
-            # CHANGED: write a discoverable failure marker instead of just
-            # logging. A run directory now ALWAYS ends up with either
-            # test_metrics.json (success) or test_eval_failed.json
-            # (failure) -- never neither, which was the original bug: exit
-            # code 0 + no test_metrics.json + nothing visible outside the
-            # per-run log file.
+
             print("Test eval failed:")
             traceback.print_exc()
             with open(os.path.join(cfg.out_dir, "test_eval_failed.json"), "w") as f:
                 json.dump({"error": str(e), "traceback": traceback.format_exc()}, f, indent=2)
     else:
-        # CHANGED: also mark the rarer case where training finished but
-        # best.pth was never written at all (best_val stayed -1.0 on every
-        # eval epoch) -- same "always leave a marker" principle.
+
         with open(os.path.join(cfg.out_dir, "test_eval_failed.json"), "w") as f:
             json.dump({"error": "no best.pth was ever written during training"}, f, indent=2)
 
@@ -1070,8 +1002,8 @@ def main():
         "global_attn_grid": cfg.global_attn_grid,
         "global_attn_position": cfg.global_attn_position,
         "global_attn_gate_schedule": cfg.global_attn_gate_schedule,
-        **(model_stats.get("total", {}) if model_stats else {}),  # CHANGED: sicher gegen leeres model_stats
-        "model_stats": model_stats if model_stats else None,       # CHANGED: null statt KeyError, falls Test-Eval scheiterte
+        **(model_stats.get("total", {}) if model_stats else {}),  
+        "model_stats": model_stats if model_stats else None,      
     }
     with open(os.path.join(cfg.out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
@@ -1079,6 +1011,7 @@ def main():
 
 
 def _plot_history(history, path):
+    """Plot the training loss and (if available) the validation Dice."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1095,6 +1028,7 @@ def _plot_history(history, path):
 
 
 def _plot_scale_gates(history, bin_labels, path):
+    """Plot the mean scale-gate value per scale over epochs, one panel per timestep bin."""
     gates = history.get("scale_gates")
     if not gates:
         return

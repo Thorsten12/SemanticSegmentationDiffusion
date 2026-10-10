@@ -1,26 +1,25 @@
-"""Gaussian diffusion on point coordinates (x0-prediction parameterization).
+"""Gaussian diffusion on contour point coordinates (x0-prediction).
 
-The denoiser predicts the clean points x0 directly. Training minimizes an
-x0 MSE (down-weighted at high noise levels via alpha_bar) plus a uniformity
-regularizer that keeps the predicted points evenly spaced around the closed
-contour. Sampling uses deterministic DDIM with classifier-free guidance.
+The denoiser predicts the clean points x0 directly. Training minimizes a
+min-SNR-weighted x0 MSE together with auxiliary geometric terms (soft-Dice,
+Boundary-IoU, nearest-point, boundary attention, uniformity, curvature).
+Sampling uses deterministic DDIM with classifier-free guidance (CFG).
 
-V5: optionally, a deterministic coarse-contour proposal (see `proposal.py`)
-supplies global position/size/coarse-shape, and the denoiser only predicts
-the residual on top of it (`proposal_target="residual"`). This is a
-*different* residual from `ContourDenoiser.predict_residual` (which is a
-points-vs-noise residual inside the denoiser itself) -- the proposal
-combination happens one level up, applied identically to the reconstructed
-x0 in both `training_losses` (via the caller, see train.py) and here in
-`ddim_sample`.
+Optional components
+-------------------
+Coarse-contour proposal:
+    A deterministic coarse contour (see `proposal.py`) provides global
+    position, size and coarse shape; the denoiser then predicts only the
+    residual on top of it (`proposal_target="residual"`). The proposal is
+    combined with the reconstructed x0 identically in training (by the caller)
+    and in `ddim_sample`. This is distinct from the points-vs-noise residual
+    inside the denoiser itself (`ContourDenoiser.predict_residual`).
 
-V6: `ddim_sample` optionally applies the `BoundarySnapper` INSIDE the
-sampling loop instead of (or in addition to) as a one-shot post-hoc step
-after DDIM finishes. This matches the V5.2 README's description of the
-snapper as a "low-t only" correction that lives inside low-noise diffusion,
-rather than the standalone post-DDIM refiner in `snapper.py`'s own
-docstring. See `ddim_sample`'s `snapper` / `snap_t_threshold` /
-`snap_every` args below for the exact gating rule.
+In-loop boundary snapping:
+    `ddim_sample` can apply a `BoundarySnapper` to the x0 estimate inside the
+    sampling loop, restricted to low-noise steps. This is an alternative to,
+    and can be combined with, the standalone post-DDIM refinement described
+    in `snapper.py`.
 """
 
 from ..utils.helper_funcs import calc_boundary_att
@@ -38,13 +37,16 @@ def _extract(a: torch.Tensor, t: torch.Tensor, x_shape) -> torch.Tensor:
 
 
 def nearest_point_loss(predicted_x0, x0, t, T, gamma=1.0):
-    """Asymmetrischer Nearest-Neighbor-Loss (pred -> GT).
-    Für jeden vorhergesagten Punkt wird die Distanz zum nächstgelegenen
-    Ground-Truth-Konturpunkt bestimmt (kein 1:1-Korrespondenz-Zwang, im
-    Gegensatz zur normalen x0-MSE). Zeitgewichtung: bei t=0 maximal (=1),
-    fällt zu t=T-1 auf ~0 ab.
-    predicted_x0, x0: [B, N, 2]
-    t: [B] (long, timestep indices)
+    """Asymmetric nearest-neighbor loss (prediction -> ground truth).
+
+    For each predicted point, the distance to the closest ground-truth contour
+    point is computed. Unlike the x0 MSE, no one-to-one vertex correspondence
+    is enforced. The loss is weighted by (1 - t / (T - 1))^gamma, i.e. maximal
+    at t = 0 and vanishing at t = T - 1.
+
+    Args:
+        predicted_x0, x0: [B, N, 2].
+        t: [B] long, timestep indices.
     """
     dists = torch.cdist(predicted_x0, x0, p=2)          # [B, N_pred, N_gt]
     min_dists, _ = dists.min(dim=-1)                    # [B, N_pred]
@@ -53,26 +55,25 @@ def nearest_point_loss(predicted_x0, x0, t, T, gamma=1.0):
     w_t = (1.0 - t.float() / (T - 1)).clamp(min=0.0, max=1.0) ** gamma  # [B]
     loss = (w_t * per_sample).mean()
     return loss
-    
+
 
 def curvature_penalty_loss(predicted_x0, t, T, gamma=1.0):
-    """Bestraft hohe lokale Krümmung (zweite Differenz entlang der
-    geschlossenen Kontur) der VORHERGESAGTEN Punkte selbst -- kein
-    Vergleich gegen GT, reine Formvorgabe an das Modell.
+    """Smoothness prior on the predicted contour (second-difference penalty).
 
-    Zeitgewichtet wie loss_dice (stark bei hohem t, schwach bei niedrigem
-    t): zwingt das Modell bei starkem Rauschen zu einer glatten,
-    niederfrequenten Kontur -- das ist alles, was aus einer nur grob
-    aufgeloesten frühen Scale (z.B. 7x7) ueberhaupt ableitbar ist -- und
-    laesst diesen Zwang zum Ende der Sampling-Kette hin nach, wo feinere
-    Scales tatsaechlich lokale Information liefern koennen.
+    Penalizes the squared norm of the second difference along the closed
+    contour. The term is a pure shape prior on the prediction and involves no
+    comparison to the ground truth.
 
-    Komplementaer zu nearest_point_loss/loss_biou (die GENAUIGKEIT ggü.
-    GT bei niedrigem t einfordern): dieser Term fordert reine GLATTHEIT
-    bei hohem t, unabhaengig davon, wo GT tatsaechlich liegt.
+    Weighted by (t / (T - 1))^gamma, i.e. strong at high noise and fading
+    towards t = 0. At high noise, only a coarse, low-frequency contour can be
+    inferred from the low-resolution early-scale features, so smoothness is
+    enforced there; the constraint is relaxed late in the chain, where finer
+    scales provide local information. This complements `nearest_point_loss`
+    and the Boundary-IoU term, which demand accuracy at low t.
 
-    predicted_x0: [B, N, 2]
-    t: [B] (long, timestep indices)
+    Args:
+        predicted_x0: [B, N, 2].
+        t: [B] long, timestep indices.
     """
     prev_p = torch.roll(predicted_x0, shifts=1, dims=1)
     next_p = torch.roll(predicted_x0, shifts=-1, dims=1)
@@ -82,11 +83,13 @@ def curvature_penalty_loss(predicted_x0, t, T, gamma=1.0):
     w_t = (t.float() / (T - 1)).clamp(min=0.0, max=1.0) ** gamma
     return (w_t * per_sample).mean()
 
+
 class GaussianDiffusion:
     def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=2e-2, device="cuda"):
         self.timesteps = timesteps
         self.device = device
 
+        # Linear beta schedule and derived cumulative quantities.
         betas = torch.linspace(beta_start, beta_end, timesteps, device=device)
         alphas = 1.0 - betas
         self.betas = betas
@@ -111,54 +114,55 @@ class GaussianDiffusion:
                         lambda_mse=1.0, lambda_uniformity=0.0, lambda_dice=1.0, lambda_boundary=1.0, snr_gamma=5.0,
                         lambda_biou=1.0, biou_gamma=1.0,
                         lambda_nearest=1.0, nearest_gamma=1.0,
-                        lambda_curvature=0.0, curvature_gamma=1.0,   # NEW
+                        lambda_curvature=0.0, curvature_gamma=1.0,
                         soft_dice_size=64):
-        """Per-sample min-SNR-weighted x0 MSE + uniformity + soft-Dice +
-        Boundary-IoU + nearest-point term.
+        """Weighted sum of coordinate-level and mask-level training losses.
 
-        `predicted_x0` here is expected to already be the FINAL x0 candidate
-        -- i.e. if you're using the V5 proposal, the caller has already
-        combined the denoiser's raw output with the proposal via
-        `apply_proposal_target` before calling this. This function itself
-        stays proposal-agnostic; it just compares whatever x0 it's given
-        against GT.
+        Terms:
+            loss_x0:         min-SNR-weighted x0 MSE.
+            loss_boundary:   boundary-attention-weighted squared error.
+            loss_uniformity: std of neighbor distances along the closed contour
+                             (keeps points evenly spaced).
+            loss_dice:       soft-Dice between the rasterized polygon and the
+                             GT mask; time-weighted, strong at high t (coarse
+                             shape).
+            loss_biou:       differentiable Boundary IoU (Sun et al., MICCAI
+                             2023) between the rasterized polygon and the GT
+                             mask, focused on the boundary band. Time-weighted
+                             opposite to loss_dice: strongest at low t (fine
+                             boundary detail), fading to 0 at high t.
+            loss_nearest:    asymmetric pred -> GT nearest-neighbor distance;
+                             time-weighted like loss_biou.
+            loss_curvature:  second-difference smoothness prior on the
+                             prediction (no GT); time-weighted like loss_dice.
+                             See `curvature_penalty_loss`.
 
-        masks (optional, [B,1,H,W] in {0,1}) enables the differentiable soft-Dice
-        and Boundary-IoU terms, which give the boundary points a geometry-aware
-        (mask-level) signal instead of relying solely on order-dependent
-        coordinate MSE.
+        Mask-level terms (dice, biou) require `masks` ([B, 1, H, W] in {0, 1})
+        and give the points a geometry-aware signal instead of relying solely
+        on order-dependent coordinate MSE.
 
-        lambda_biou (default 1.0): weight for the differentiable Boundary IoU
-        loss (Sun et al., MICCAI 2023) between the rasterized predicted polygon
-        and the GT mask, focused on the boundary band rather than the whole
-        shape. Requires `masks`, like loss_dice. Time-weighted the OPPOSITE
-        direction from loss_dice: strongest at low t (clean, fine boundary
-        detail matters most), fades to 0 at high t (pure noise, only coarse
-        shape matters -- that's loss_dice's job).
+        Every term is computed only if its lambda is > 0, which saves compute
+        and ensures the logged value reflects what contributes to `total`.
 
-        lambda_nearest (default 1.0): weight for the asymmetric nearest-neighbor
-        term (pred -> GT). Time-weighted like loss_biou (strongest at low t).
+        `predicted_x0` must already be the final x0 candidate: when a proposal
+        is used, the caller has combined the denoiser output with the proposal
+        via `apply_proposal_target`. This function is proposal-agnostic.
 
-        Every auxiliary term (uniformity, boundary, dice, biou, nearest) is only
-        computed when its lambda is > 0 -- both to save compute and so the
-        logged/printed value reflects what's actually contributing to `total`
-        (a lambda of 0.0 now always shows 0.0000 instead of a nonzero number
-        that has no effect on the gradient).
-
-        lambda_curvature (default 0.0, aus, altes Verhalten): Gewicht für
-        einen reinen Selbst-Constraint auf die Kontur-Glattheit der
-        Vorhersage (kein GT-Vergleich). Zeitgewichtet wie loss_dice
-        (stark bei hohem t, schwach bei niedrigem t) -- siehe
-        curvature_penalty_loss's Docstring.
+        Args:
+            predicted_x0, x0: [B, N, 2].
+            t: [B] long, timestep indices.
+            snr_gamma: Clamp value of the min-SNR weight.
+        Returns:
+            (total_loss, dict of detached per-term losses).
         """
-        # Per-sample min-SNR-gamma weighting (x0 parameterization). SNR = a_bar /
-        # (1 - a_bar); clamping at gamma stops low-noise steps from dominating, and
-        # -- unlike the old a_bar weighting -- high-noise steps keep real gradient.
+        # Min-SNR-gamma weighting (x0 parameterization): SNR = a_bar / (1 - a_bar),
+        # clamped at gamma so low-noise steps do not dominate while high-noise
+        # steps retain meaningful gradient. Normalized to keep the scale ~1.
         if lambda_mse > 0:
             a_bar = _extract(self.alphas_cumprod, t, x0.shape)            # [B,1,1]
             snr = a_bar / (1.0 - a_bar).clamp(min=1e-8)
             w = snr.clamp(max=snr_gamma)
-            w = w / w.mean().clamp(min=1e-8)                             # keep scale ~1
+            w = w / w.mean().clamp(min=1e-8)
             se = ((predicted_x0 - x0) ** 2).mean(dim=tuple(range(1, x0.ndim)),
                                                  keepdim=True)            # [B,1,1]
             loss_x0 = (w * se).mean()
@@ -171,7 +175,7 @@ class GaussianDiffusion:
         else:
             loss_boundary = torch.zeros((), device=x0.device)
 
-        # Closed-contour uniformity: penalize variance of neighbor distances.
+        # Uniformity: penalize the spread of neighbor distances on the closed contour.
         if lambda_uniformity > 0:
             nxt = torch.roll(predicted_x0, shifts=-1, dims=1)
             dists = torch.norm(predicted_x0 - nxt, dim=-1)        # [B, N]
@@ -179,7 +183,7 @@ class GaussianDiffusion:
         else:
             loss_uniformity = torch.zeros((), device=x0.device)
 
-        # Differentiable mask-level term (rasterize polygon -> soft-Dice).
+        # Mask-level terms: rasterize the polygon differentiably, then compare to GT.
         if masks is not None and lambda_dice > 0:
             loss_dice = soft_dice_loss(predicted_x0, masks, size=soft_dice_size,
                                        t=t, T=self.timesteps)
@@ -227,64 +231,54 @@ class GaussianDiffusion:
                     collect_every=0):
         """Deterministic DDIM sampling with classifier-free guidance.
 
-        denoise_fn(x, t, cond_maps) -> predicted x0 (residual-on-proposal or
-        full x0, depending on `proposal_target` -- this function only
-        combines them; the denoiser itself is unaware of the proposal).
-        cond_fn(t) -> list of condition maps for timestep t (may be time-dependent);
-        the unconditional pass uses zeroed maps.
+        At each step, the x0 estimate is formed as follows: denoiser output
+        (conditional and, if CFG is active, unconditional) -> CFG interpolation
+        -> proposal combination -> clamp -> optional snapping. The DDIM update
+        then uses this final x0.
 
-        proposal: [B,N,2] deterministic coarse-contour proposal (V5, see
-        `proposal.py`), or None. Computed once by the caller (it doesn't
-        depend on t), applied at every sampling step here.
-        proposal_target: "absolute" (proposal ignored, pre-V5 behavior) or
-        "residual" (x0 = proposal + denoiser_out at every step).
+        Args:
+            denoise_fn: (x, t, cond_maps) -> predicted x0, or the residual on
+                the proposal, depending on `proposal_target`. The denoiser is
+                unaware of the proposal; it is combined here.
+            cond_fn: t -> list of condition maps (may be time-dependent). The
+                unconditional CFG pass uses zeroed maps.
+            shape: Shape of the sampled points, [B, N, 2].
+            guidance_scale: CFG scale; x0 = x0_uncond + s * (x0_cond - x0_uncond).
+                A value of 1.0 disables the unconditional pass.
+            clamp: Symmetric clamp applied to x0 in normalized coordinates.
+            proposal: [B, N, 2] deterministic coarse-contour proposal (see
+                `proposal.py`) or None. It does not depend on t and is
+                computed once by the caller.
+            proposal_target: "absolute" (proposal ignored) or "residual"
+                (x0 = proposal + denoiser output at every step). The proposal
+                is added once per step AFTER the CFG interpolation, matching
+                training, where the conditional prediction is combined with
+                the proposal exactly once.
 
-        Note: the proposal is added ONCE per step, AFTER the CFG
-        interpolation between x0_cond and x0_uncond -- not inside each
-        branch separately. This matches training, where `pred_x0` (the
-        analogue of x0_cond there, after the CFG-dropout masking) is
-        combined with the proposal exactly once.
+            In-loop snapping:
+            snapper: Optional `BoundarySnapper`, applied to the per-step x0
+                estimate, restricted to low-noise steps.
+            snap_maps: Raw backbone feature maps (not the fused `cond_maps`
+                from `cond_fn`), as `BoundarySnapper` samples raw multi-scale
+                features directly. Required if `snapper` is given; computed
+                once by the caller.
+            snap_image: Optional raw image for the snapper's RGB path. If None,
+                the snapper skips its RGB term.
+            snap_t_threshold: Snap only at timesteps t <= snap_t_threshold
+                (the tail of sampling). None disables in-loop snapping even if
+                a snapper is given. A typical value is a small fraction of
+                `self.timesteps`, e.g. int(0.15 * timesteps).
+            snap_every: Within the eligible window, snap only every
+                `snap_every`-th DDIM step to trade correction frequency for
+                compute. 1 snaps at every eligible step.
 
-        --- V6: optional in-loop boundary snapping -----------------------
-        snapper: optional `BoundarySnapper` instance. When given (together
-            with `snap_maps`), applied to the per-step x0 estimate DURING
-            sampling, gated to low-noise steps only -- matching the V5.2
-            README's description of the exact-boundary correction as a
-            "low-t only" branch that lives inside the diffusion process,
-            as opposed to `snapper.py`'s own standalone post-DDIM usage
-            (still available separately; this is an alternative, not a
-            replacement -- see `evaluate()` in sample.py for how the two
-            compose).
-        snap_maps: the RAW backbone feature maps (same list passed to the
-            denoiser's conditioning path via `encoder.extract`, NOT the
-            fused `cond_maps` from `cond_fn`) -- required if `snapper` is
-            given, since `BoundarySnapper` samples raw multi-scale features
-            directly (see snapper.py's docstring). Computed once by the
-            caller, like `proposal`.
-        snap_image: optional raw image tensor for the snapper's RGB sampling
-            path (`BoundarySnapper(use_rgb=True)`); pass None to let the
-            snapper skip its RGB term (harmless -- it's additive).
-        snap_t_threshold: apply the snapper only at timesteps `t <=
-            snap_t_threshold` (i.e. the tail of sampling, closest to clean).
-            `None` disables in-loop snapping entirely regardless of whether
-            `snapper` is provided, so passing a snapper without a threshold
-            is a deliberate, explicit no-op rather than an implicit
-            always-on behavior. A typical value is a small fraction of
-            `self.timesteps`, e.g. `int(0.15 * timesteps)`, mirroring the
-            V5.2 README's "low-t only" framing.
-        snap_every: only run the snapper every `snap_every`-th eligible
-            DDIM step (within the low-t window) rather than on all of them,
-            trading correction frequency for compute -- since each snap call
-            costs the snapper's own forward pass at every one of `n_points`
-            per sample. `1` (default) snaps every eligible step.
+            collect_every: If > 0, the x0 estimate at every `collect_every`-th
+                DDIM step (and always the last) is stored and returned as
+                `(x, intermediates)`, where `intermediates` is a list of
+                detached [B, N, 2] tensors in sampling order (coarse -> clean).
+                If <= 0 (default), only `x` is returned.
 
-        collect_every: if > 0, the x0 estimate at every `collect_every`-th DDIM
-        step (plus always the very last step) is stored and returned as a
-        second value: `(x, intermediates)` where `intermediates` is a
-        Python list of tensors [B,N,2] (detached, still on `device`), in
-        sampling order (noisy/coarse -> clean). If `collect_every <= 0`
-        (default), behavior is UNCHANGED: only `x` is returned, so all
-        existing call sites keep working without modification.
+            eta: Unused; sampling is fully deterministic.
         """
         device = self.device
         x = torch.randn(shape, device=device)
@@ -301,6 +295,7 @@ class GaussianDiffusion:
         for i, t in enumerate(timesteps):
             t_b = torch.full((shape[0],), t, device=device, dtype=torch.long)
 
+            # Classifier-free guidance.
             cond_maps = cond_fn(t_b)
             x0_cond = denoise_fn(x, t_b, cond_maps)
             if guidance_scale != 1.0:
@@ -312,22 +307,21 @@ class GaussianDiffusion:
             x0 = apply_proposal_target(x0, proposal, proposal_target)
             x0 = torch.clamp(x0, -clamp, clamp)
 
+            # Optional in-loop snapping (low-noise steps only).
             if do_snap and t <= snap_t_threshold:
                 if snap_call_idx % max(1, int(snap_every)) == 0:
                     x0 = snapper(x0, snap_maps, image=snap_image, hard=True)
                     x0 = torch.clamp(x0, -clamp, clamp)
                 snap_call_idx += 1
 
-            # --- NEW: stash this step's x0 estimate for the GIF -------------
-            # Stored AFTER proposal/clamp/snap, i.e. exactly the x0 this step
-            # actually commits to -- the same quantity the DDIM update below
-            # uses, so the GIF shows the real denoising trajectory rather than
-            # a pre-correction intermediate.
+            # Record the x0 this step commits to (after proposal, clamp and
+            # snapping), i.e. the same quantity used in the DDIM update below.
             if do_collect:
                 is_last = (i == len(timesteps) - 1)
                 if is_last or (i % collect_every == 0):
                     intermediates.append(x0.detach().clone())
 
+            # DDIM update (eta = 0): x_{t_prev} = sqrt(a_prev) * x0 + sqrt(1 - a_prev) * eps_hat.
             a_bar = self.alphas_cumprod[t]
             t_prev = timesteps[i + 1] if i + 1 < len(timesteps) else -1
             a_bar_prev = self.alphas_cumprod[t_prev] if t_prev >= 0 else torch.tensor(1.0, device=device)

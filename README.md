@@ -118,3 +118,22 @@ python -m x0_prediction.train --dataset isic2018 \
     --gif --gif_steps 50 \
     --out_dir x0_prediction/runs/ablation_v17_phase2b_boundary_fine_deform
 ```
+
+## Results
+
+### Segmentation Performance
+
+On **ISIC2018**, P2SDiff achieves a Dice score of **90.18 ± 0.44** using 5 DDIM sampling steps, a guidance scale of 2.0, and the deformable sampler.
+
+### Computational Efficiency
+
+| Model / Component | Params (M) | FLOPs (G) | Latency / image (ms) | Peak Mem (MB) |
+|:---|---:|---:|---:|---:|
+| **P2SDiff (5 steps)** | **29.04** | **5.67** | **4.20** | **848** |
+| ↳ Encoder (1×) | 27.83 | 4.98 | 1.02 | 240 |
+| ↳ Denoiser (10×) | 1.13 | 0.65 | 3.07 | 18 |
+| ↳ Snapper (3×) | 0.08 | 0.04 | 0.33 | 9 |
+
+The model combines a shared image encoder, iterative contour denoising, and boundary refinement. The encoder is executed once, while the denoiser and boundary snapper are invoked multiple times during inference.
+
+**Evaluation configuration:** ISIC2018 · 5 DDIM steps · Guidance scale 2.0 · Deformable sampler

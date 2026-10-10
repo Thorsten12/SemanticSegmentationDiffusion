@@ -1,49 +1,43 @@
-"""Post-DDIM normal-profile boundary snapper (V3/V5.2-style, standalone).
+"""Confidence-gated normal-offset boundary snapper.
 
-Design-Ziel: der Diffusions-Denoiser trifft die grobe Form gut, aber lokale
-Details (exakte Kante) driften. Dieser Snapper ist bewusst NICHT in den
-Diffusions-Forward-Pass eingezogen (kein additiver low_t-Gate wie V5.2) --
-er läuft stattdessen einmalig NACH dem fertigen DDIM-Sampling, genau wie der
-V3-`NormalBoundaryRefiner`.
+A lightweight post-processing module applied once after DDIM sampling. The
+diffusion model recovers the global contour shape well, but exact boundary
+locations may drift locally. The snapper refines these local details and is
+deliberately decoupled from the diffusion forward pass.
 
-Kernidee (identisch zu V5.2's SparseExactBoundaryCorrector, aber ohne den
-dichten Boundary-Head -- hier wird direkt auf den rohen Backbone-Maps
-gesampelt, um die Architektur schlank zu halten):
+Method
+------
+1. Profile sampling: for each of the N contour points, a 1D profile is sampled
+   along the local normal from the raw backbone feature maps (multiple encoder
+   scales, optionally raw RGB).
+2. Ring communication: a small conv/attention block lets the N points exchange
+   information along the closed contour (cyclic neighborhood, no learned
+   per-index embeddings).
+3. Prediction heads: a signed normal offset and a confidence logit. The offset
+   is applied with weight sigmoid(conf)^p, so low-confidence points are left
+   (almost) untouched. This prevents the snapper from attempting to correct
+   large, global errors it is not designed for.
 
-  1. Für jeden der N Konturpunkte wird entlang der lokalen Normalen ein
-     kurzes 1-D-Profil aus den rohen Feature-Maps gelesen (mehrere Encoder-
-     Skalen, optional plus rohes RGB).
-  2. Ein kleiner Transformer/Conv-Block lässt die N Punkte entlang des
-     Rings kommunizieren (zyklische Nachbarschaft, kein Positions-ID).
-  3. Zwei Köpfe sagen (a) einen signierten Normal-Offset und (b) eine
-     Konfidenz vorher. Die Korrektur wird nur `confidence^power`-gewichtet
-     angewendet -- niedrige Konfidenz -> praktisch keine Korrektur, damit
-     der Snapper nicht versucht, große (globale) Fehler zu "reparieren",
-     für die er nicht gebaut ist.
+Training
+--------
+The snapper is trained with a separate teacher loss on artificially perturbed
+ground-truth contours rather than on on-policy DDIM intermediates. Early
+rollouts are often far from the ground truth, which would drive the confidence
+head to collapse to "always uncertain". Perturbed ground truth instead yields
+realistic near-boundary inputs that require only fine adjustments, independent
+of the current quality of the diffusion model.
 
-Training: eigener, separater Loss (`teacher_loss`), analog zu V3 und
-V5.2's Teacher-Pfad. Der Snapper wird NICHT auf echten On-Policy-DDIM-
-Zwischenständen trainiert (die sind früh im Training oft weit von GT
-entfernt -- das würde den Confidence-Kopf zu "immer unsicher" kollabieren
-lassen), sondern auf künstlich normal-perturbierten GT-Konturen
-(`perturb_along_normals`). Das gibt dem Snapper von Anfang an reichlich
-realistische "fast richtig, nur noch Feinkorrektur nötig"-Beispiele,
-unabhängig davon, wie gut der Diffusionspfad gerade ist.
+The loss combines offset regression (`loss_offset`), confidence classification
+(`loss_conf`) and an optional BoundaryIoU term (`loss_biou`). The latter
+rasterizes the contour that `forward()` would output (same confidence gate,
+via `_apply_gate`) and compares it to the ground-truth mask, providing a
+mask-level geometric signal.
 
-`teacher_loss` kombiniert weiterhin die Offset-/Confidence-Regression
-(`loss_offset`, `loss_conf`) mit einem NEUEN, optionalen BoundaryIoU-Term
-(`loss_biou`): dafür wird aus `offset_pred`/`conf_logit` exakt dieselbe
-korrigierte Kontur rekonstruiert, die `forward()` bei der Inferenz erzeugen
-würde (gleiches Confidence-Gate), und gegen die GT-Maske rasterisiert. Das
-gibt dem Snapper ein zusätzliches, geometrie-bewusstes Signal auf Maskenebene
--- unabhängig vom Diffusions- und Proposal-Loss, und ohne dass der Snapper
-auf echten Diffusions-Rollouts trainiert werden muss (weiterhin nur die
-künstlich perturbierten Teacher-Konturen).
-
-Öffentliche API:
+Public API
+----------
     snapper = BoundarySnapper(scale_channels=encoder.feature_channels, n_points=100)
-    corrected = snapper(points, maps, image=None, hard=True)     # Inferenz
-    loss, parts = snapper.teacher_loss(gt_points, maps, image=None)  # Training
+    corrected = snapper(points, maps, image=None)                # inference
+    loss, parts = snapper.teacher_loss(gt_points, maps, image)   # training
 """
 
 from __future__ import annotations
@@ -58,11 +52,18 @@ from ..utils.rasterize import soft_boundary_iou_loss
 
 
 # --------------------------------------------------------------------------
-# Geometrie-Hilfsfunktionen (identisch zum V3/V5.2-Muster)
+# Contour geometry utilities
 # --------------------------------------------------------------------------
 
 def contour_frame(points: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Tangente + Normale für eine geschlossene, geordnete Kontur [B,N,2]."""
+    """Tangent and normal of a closed, ordered contour.
+
+    Args:
+        points: Contour vertices, shape [B, N, 2].
+    Returns:
+        (tangent, normal), each [B, N, 2] and unit length. Tangents use central
+        differences over the cyclic neighbors.
+    """
     prev_p = torch.roll(points, shifts=1, dims=1)
     next_p = torch.roll(points, shifts=-1, dims=1)
     tangent = next_p - prev_p
@@ -72,7 +73,7 @@ def contour_frame(points: torch.Tensor, eps: float = 1e-6) -> Tuple[torch.Tensor
 
 
 def curvature_scalar(points: torch.Tensor) -> torch.Tensor:
-    """Zweite-Differenz-Krümmungsmaß [B,N,1]."""
+    """Curvature proxy via the norm of the second difference, shape [B, N, 1]."""
     prev_p = torch.roll(points, shifts=1, dims=1)
     next_p = torch.roll(points, shifts=-1, dims=1)
     return torch.norm(prev_p - 2.0 * points + next_p, dim=-1, keepdim=True)
@@ -83,12 +84,12 @@ def perturb_along_normals(
     max_offset: float = 0.08,
     smooth_passes: int = 2,
 ) -> torch.Tensor:
-    """Erzeugt künstlich leicht-falsche Konturen aus GT für das Teacher-Training.
+    """Generate slightly erroneous contours from ground truth (teacher inputs).
 
-    Zufälliger Offset pro Vertex entlang der Normalen, geglättet über
-    `smooth_passes` (gewichtetes Mitteln mit den Ringnachbarn), damit die
-    Störung wie eine plausible, kontinuierliche Ungenauigkeit aussieht statt
-    Vertex-für-Vertex-Rauschen.
+    A uniform random offset is drawn per vertex and applied along the normal.
+    The offsets are smoothed over the ring neighbors ([1, 2, 1] / 4 kernel,
+    `smooth_passes` times) so that the perturbation resembles a plausible,
+    spatially continuous inaccuracy rather than i.i.d. vertex noise.
     """
     _, normal = contour_frame(points)
     displacement = torch.empty(
@@ -104,30 +105,36 @@ def perturb_along_normals(
 
 
 def sample_at_points(feat_map: torch.Tensor, locations: torch.Tensor) -> torch.Tensor:
-    """Bilineares Sampling einer [B,C,H,W]-Karte an [B,N,K,2]-Punkten (Range [-1,1]).
+    """Bilinearly sample a feature map at arbitrary locations.
 
-    Gibt [B,N,K,C] zurück. Nutzt F.grid_sample intern (grid_sample erwartet
-    [B,H_out,W_out,2] -- wir flachen N*K in die H_out-Dimension).
+    Args:
+        feat_map: [B, C, H, W].
+        locations: [B, N, K, 2] in normalized coordinates [-1, 1].
+    Returns:
+        Samples of shape [B, N, K, C].
     """
+    # grid_sample expects [B, H_out, W_out, 2]; N*K is folded into H_out.
     b, n, k, _ = locations.shape
     grid = locations.view(b, n * k, 1, 2)
     sampled = F.grid_sample(feat_map, grid, mode="bilinear",
-                             padding_mode="border", align_corners=True)  # [B,C,N*K,1]
-    sampled = sampled.squeeze(-1).transpose(1, 2)                       # [B,N*K,C]
+                             padding_mode="border", align_corners=True)  # [B, C, N*K, 1]
+    sampled = sampled.squeeze(-1).transpose(1, 2)                       # [B, N*K, C]
     return sampled.view(b, n, k, -1)
 
 
 # --------------------------------------------------------------------------
-# Ring-Kommunikationsblock (identisch zum V5.2-Muster, hier eigenständig)
+# Ring communication block
 # --------------------------------------------------------------------------
 
 class _CyclicRelativeBlock(nn.Module):
-    """Kleiner ring-bewusster Kommunikationsblock über die N Konturpunkte.
+    """Ring-aware communication block over the N contour points.
 
-    Fixer (nicht gelernter) Attention-Bias nach zyklischem Abstand -- kein
-    gelerntes Positions-Embedding pro Vertex-Index, damit das Modul
-    unabhängig von einer festen Vertex-Nummerierung bleibt. Nur ein milder
-    Prior (nahe Nachbarn leicht bevorzugt), keine harte Maskierung.
+    Combines a circular 1D convolution, multi-head self-attention and a
+    feed-forward layer (pre-norm residual structure). Attention uses a fixed,
+    non-learned bias that depends on cyclic distance. This acts as a mild
+    locality prior (nearby neighbors slightly favored) without hard masking,
+    and avoids per-index embeddings, keeping the module independent of a
+    particular vertex numbering.
     """
 
     def __init__(self, dim: int, num_heads: int, n_points: int, bias_strength: float = 0.12):
@@ -142,6 +149,9 @@ class _CyclicRelativeBlock(nn.Module):
             nn.Linear(dim * 2, dim),
         )
 
+        # Attention bias: linear in normalized cyclic distance, in
+        # [-bias_strength, +bias_strength] (maximal for self, minimal for the
+        # antipodal vertex).
         idx = torch.arange(n_points, dtype=torch.float32)
         d = (idx[:, None] - idx[None, :]).abs()
         d = torch.minimum(d, float(n_points) - d)
@@ -161,24 +171,28 @@ class _CyclicRelativeBlock(nn.Module):
 
 
 # --------------------------------------------------------------------------
-# Der Snapper selbst
+# Boundary snapper
 # --------------------------------------------------------------------------
 
 class BoundarySnapper(nn.Module):
-    """Confidence-gated Normal-Offset-Snapper, Post-DDIM-Nachbearbeitung.
+    """Confidence-gated normal-offset snapper (post-DDIM refinement).
 
     Args:
-        scale_channels: Kanalzahlen der rohen Backbone-Maps, genau wie
-            `encoder.feature_channels` im Denoiser (`ContourDenoiser`).
-        n_points: Anzahl Konturpunkte (muss zu deinem Diffusionsmodell passen).
-        levels: wie viele der (feinsten) `scale_channels`-Level gesampelt werden.
-        n_samples: Anzahl Profil-Samples entlang der Normalen (ungerade erzwungen,
-            damit ein Sample exakt beim Vertex selbst liegt).
-        radius: max. Suchradius entlang der Normalen (in denselben normalisierten
-            Koordinaten wie deine Punkte, also [-1,1]-Bildraum).
-        confidence_power: Schärfe des Confidence-Gates (`sigmoid(conf)^power`).
-        use_rgb: zusätzlich rohes RGB an denselben Stellen sampeln (sparse,
-            kein dichter RGB-Decoder).
+        scale_channels: Channel counts of the raw backbone maps, identical to
+            `encoder.feature_channels` of the denoiser.
+        n_points: Number of contour points (must match the diffusion model).
+        levels: Number of (finest) feature levels to sample.
+        n_samples: Number of profile samples along the normal. Forced to be
+            odd so that one sample lies exactly on the vertex.
+        radius: Maximum search radius along the normal, in normalized [-1, 1]
+            image coordinates.
+        profile_dim: Per-sample embedding dimension.
+        hidden_dim: Token dimension of the ring block and heads.
+        ring_bands: Number of sin/cos harmonics of the fixed ring-position feature.
+        num_heads: Attention heads in the ring block.
+        relative_bias_strength: Amplitude of the cyclic attention bias.
+        confidence_power: Exponent p of the confidence gate sigmoid(conf)^p.
+        use_rgb: Additionally sample raw RGB at the profile locations.
     """
 
     def __init__(
@@ -209,6 +223,7 @@ class BoundarySnapper(nn.Module):
         self.confidence_power = max(float(confidence_power), 1.0)
         self.use_rgb = bool(use_rgb)
 
+        # Per-level projection of sampled features to a common profile dimension.
         self.sample_proj = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(c, self.profile_dim), nn.GELU(),
@@ -221,13 +236,14 @@ class BoundarySnapper(nn.Module):
             nn.Linear(self.profile_dim, self.profile_dim),
         ) if self.use_rgb else None
 
+        # Aggregates the K-sample profile into one token per vertex.
         self.profile_mlp = nn.Sequential(
             nn.Linear(self.n_samples * self.profile_dim, self.hidden_dim), nn.GELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
 
-        # Fixes Ring-Positions-Feature (sin/cos über mehrere Harmonische),
-        # kein gelerntes Embedding pro Index.
+        # Fixed ring-position feature (sin/cos over several harmonics);
+        # no learned per-index embedding.
         import math
         phi = 2.0 * math.pi * torch.arange(self.n_points, dtype=torch.float32) / self.n_points
         ring = []
@@ -240,7 +256,7 @@ class BoundarySnapper(nn.Module):
             nn.Linear(self.hidden_dim, self.hidden_dim),
         )
 
-        # Geometrie-Features pro Vertex: xy + Tangente + Normale + Krümmung + Radialabstand
+        # Per-vertex geometry: xy, tangent, normal, curvature, normalized radial distance.
         self.geom_mlp = nn.Sequential(
             nn.Linear(2 + 2 + 2 + 1 + 1, self.hidden_dim), nn.GELU(),
             nn.Linear(self.hidden_dim, self.hidden_dim),
@@ -259,7 +275,8 @@ class BoundarySnapper(nn.Module):
             nn.Linear(self.hidden_dim, self.hidden_dim // 2), nn.GELU(),
             nn.Linear(self.hidden_dim // 2, 1),
         )
-        # Start als Identität: der Snapper korrigiert bei Init noch nichts.
+        # Zero-init the output layers: zero offset at initialization, so the
+        # snapper starts as an identity mapping.
         nn.init.zeros_(self.offset_head[-1].weight)
         nn.init.zeros_(self.offset_head[-1].bias)
         nn.init.zeros_(self.conf_head[-1].weight)
@@ -269,20 +286,30 @@ class BoundarySnapper(nn.Module):
         self.register_buffer("profile_offsets", offsets, persistent=True)
         self.last_stats: Dict[str, torch.Tensor] = {}
 
-    # -- gemeinsamer interner Vorwärtspfad: Profil lesen -> Offset+Conf ------
+    # -- Shared forward path: sample profile -> predict offset and confidence --
 
     def _predict(self, points: torch.Tensor, maps: Sequence[torch.Tensor],
                  image: Optional[torch.Tensor] = None):
+        """Predict per-vertex normal offsets and confidence logits.
+
+        Returns:
+            offset: [B, N], bounded to (-radius, radius).
+            conf_logit: [B, N].
+            normal: [B, N, 2], unit normals of the input contour.
+        """
         if points.shape[1] != self.n_points:
             raise ValueError(f"expected {self.n_points} points, got {points.shape[1]}")
         tangent, normal = contour_frame(points)
+
+        # Profile locations: K equidistant samples along the normal of each vertex.
         offsets = self.profile_offsets.to(device=points.device, dtype=points.dtype)
         loc = points[:, :, None, :] + normal[:, :, None, :] * offsets.view(1, 1, -1, 1)
         loc = loc.clamp(-1.0, 1.0)
 
+        # Feature profile: mean of the projected per-level samples, plus RGB.
         profile = None
         for level in range(self.levels):
-            raw = sample_at_points(maps[level], loc)              # [B,N,K,C]
+            raw = sample_at_points(maps[level], loc)              # [B, N, K, C]
             emb = self.sample_proj[level](raw)
             profile = emb if profile is None else profile + emb
         profile = profile / float(self.levels)
@@ -291,6 +318,8 @@ class BoundarySnapper(nn.Module):
             profile = profile + self.rgb_proj(rgb)
         token = self.profile_mlp(profile.flatten(-2))
 
+        # Geometry features; the radial distance is normalized by its mean
+        # for scale invariance.
         center = points.mean(dim=1, keepdim=True)
         radial = torch.norm(points - center, dim=-1, keepdim=True)
         scale = radial.mean(dim=1, keepdim=True).clamp(min=1e-4)
@@ -305,25 +334,34 @@ class BoundarySnapper(nn.Module):
         conf_logit = self.conf_head(token).squeeze(-1)
         return offset, conf_logit, normal
 
-    # -- gemeinsame Rekonstruktion der korrigierten Kontur aus (offset, conf) -
+    # -- Shared reconstruction of the corrected contour from (offset, conf) ----
 
     def _apply_gate(self, points: torch.Tensor, offset: torch.Tensor,
                      conf_logit: torch.Tensor, normal: torch.Tensor) -> torch.Tensor:
-        """Identisches Confidence-Gating wie in `forward()`, aber als eigene
-        Methode, damit `teacher_loss` dieselbe rekonstruierte Kontur für den
-        neuen BoundaryIoU-Term nutzen kann, ohne die Inferenz-API zu berühren."""
+        """Apply the confidence-gated correction: p + n * sigmoid(c)^power * offset.
+
+        Factored out of `forward()` so that `teacher_loss` reconstructs exactly
+        the contour produced at inference for the BoundaryIoU term.
+        """
         conf_prob = torch.sigmoid(conf_logit)
         gate = conf_prob.pow(self.confidence_power)
         correction = gate * offset
         return (points + normal * correction.unsqueeze(-1)).clamp(-1.0, 1.0)
 
-    # -- öffentliche Inferenz-API --------------------------------------------
+    # -- Public inference API --------------------------------------------------
 
     def forward(self, points: torch.Tensor, maps: Sequence[torch.Tensor],
                 image: Optional[torch.Tensor] = None, hard: bool = True) -> torch.Tensor:
-        """Snapt eine fertige Kontur (z.B. DDIM-Sampling-Output). Gibt korrigierte
-        Punkte zurück. `hard=True` ist der übliche Inferenz-Fall (volle
-        Gate-Anwendung); `hard=False` existiert nur der Vollständigkeit halber."""
+        """Refine a finished contour (e.g. the DDIM sampling output).
+
+        Args:
+            points: Contour to refine, [B, N, 2] in [-1, 1].
+            maps: Raw backbone feature maps, finest level first.
+            image: Optional RGB image, [B, 3, H, W].
+            hard: Kept for API compatibility; the gate is always applied in full.
+        Returns:
+            Corrected contour, [B, N, 2]. Diagnostics are stored in `last_stats`.
+        """
         offset, conf_logit, normal = self._predict(points, maps, image=image)
         corrected = self._apply_gate(points, offset, conf_logit, normal)
 
@@ -339,7 +377,7 @@ class BoundarySnapper(nn.Module):
             }
         return corrected
 
-    # -- Teacher-Loss für separates Snapper-Training -------------------------
+    # -- Teacher loss for standalone snapper training --------------------------
 
     def teacher_loss(
         self,
@@ -354,26 +392,34 @@ class BoundarySnapper(nn.Module):
         lambda_biou: float = 0.0,
         biou_size: int = 64,
     ):
-        """Separater Teacher-Loss (V3/V5.2-Stil): der Snapper trainiert NICHT auf
-        echten Diffusions-Zwischenständen, sondern auf künstlich normal-
-        perturbierten GT-Konturen. Das gibt dem Confidence-Kopf von Anfang an
-        genug reale "nah an GT"-Positivbeispiele, unabhängig vom Trainingsstand
-        des Diffusionsmodells.
+        """Teacher loss on normal-perturbed ground-truth contours.
 
-        NEU: optional ein zusätzlicher, zeitunabhängiger BoundaryIoU-Term
-        (`lambda_biou > 0`, braucht `masks`). Dafür wird aus `offset_pred` /
-        `conf_logit` -- via `_apply_gate`, exakt dasselbe Gating wie in
-        `forward()` -- die vollständige korrigierte Kontur rekonstruiert und
-        gegen die GT-Maske rasterisiert. Bewertet also direkt, wie gut die
-        vom Snapper *tatsächlich ausgegebene* Kontur (inkl. Confidence-Gate)
-        geometrisch zur GT-Maske passt -- zusätzlich zur reinen Offset-/
-        Confidence-Regression, die nur die einzelnen Vorhersagen prüft.
-        Bleibt bei `lambda_biou == 0` (Default) exakt das alte Verhalten.
+        Inputs are ground-truth contours perturbed along their normals, which
+        gives the confidence head sufficient "close to ground truth" positives
+        from the start, independent of the diffusion model's training state.
 
-        Gibt (total_loss, parts-dict) zurück -- total_loss additiv ins normale
-        Trainings-Backward einhängen, z.B.:
-            snap_loss, snap_parts = snapper.teacher_loss(points, cond_maps_raw)
-            loss = diffusion_loss + lambda_snap * snap_loss
+        Targets:
+            confidence: 1 if the nearest GT point is within `confidence_radius`,
+                its tangential displacement is within `tangent_tolerance` and
+                its normal displacement is within the search radius; else 0.
+            offset: signed normal displacement to the nearest GT point,
+                clamped to [-radius, radius].
+
+        Loss terms:
+            loss_conf:   BCE on confidence logits with a clamped positive weight.
+            loss_offset: smooth-L1 on radius-normalized offsets, restricted to
+                         confident targets.
+            loss_biou:   optional BoundaryIoU between the gated corrected
+                         contour (identical to the inference output) and the
+                         GT mask; active only if `lambda_biou > 0` and `masks`
+                         is given. With `lambda_biou == 0` the loss reduces to
+                         offset + confidence regression.
+
+        Returns:
+            (total_loss, parts), where `parts` holds detached scalars for logging.
+            Usage:
+                snap_loss, snap_parts = snapper.teacher_loss(points, cond_maps_raw)
+                loss = diffusion_loss + lambda_snap * snap_loss
         """
         teacher_points = perturb_along_normals(
             gt_points.detach(), max_offset=perturb_max_offset,
@@ -381,6 +427,7 @@ class BoundarySnapper(nn.Module):
         )
         offset_pred, conf_logit, normal = self._predict(teacher_points, maps, image=image)
 
+        # Targets via nearest-neighbor correspondence to the GT contour.
         with torch.no_grad():
             d = torch.cdist(teacher_points.float(), gt_points.float(), p=2)
             min_dist, idx = d.min(dim=2)
@@ -397,11 +444,13 @@ class BoundarySnapper(nn.Module):
             ).to(teacher_points.dtype)
             target_offset = signed_n.clamp(-self.radius, self.radius)
 
+        # Confidence: class-balanced BCE (positive weight clamped to [1, 12]).
         pos = target_conf.sum().clamp(min=1.0)
         neg = (target_conf.numel() - target_conf.sum()).clamp(min=1.0)
         pos_weight = (neg / pos).clamp(1.0, 12.0)
         loss_conf = F.binary_cross_entropy_with_logits(conf_logit, target_conf, pos_weight=pos_weight)
 
+        # Offset: supervised only where the target is confident.
         w = target_conf
         if float(w.sum().item()) > 0:
             loss_offset = F.smooth_l1_loss(
@@ -413,6 +462,7 @@ class BoundarySnapper(nn.Module):
         else:
             loss_offset = offset_pred.new_zeros(())
 
+        # Optional mask-level term on the gated corrected contour.
         if masks is not None and lambda_biou > 0:
             corrected = self._apply_gate(teacher_points, offset_pred, conf_logit, normal)
             loss_biou = soft_boundary_iou_loss(corrected, masks, size=biou_size)

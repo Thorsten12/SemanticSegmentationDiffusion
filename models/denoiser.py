@@ -677,7 +677,7 @@ class ContourDenoiser(nn.Module):
         self.predict_residual = predict_residual
         self.guidance_time_scale = float(guidance_time_scale)
 
-        # NEW: the local sampler is built on a TRUNCATED scale list (finest
+        # the local sampler is built on a TRUNCATED scale list (finest
         # scales only), while self.global_attn below always uses the FULL
         # scale_channels/maps -- these are deliberately different views of
         # the same pyramid, not two independent configs to keep in sync.
@@ -801,7 +801,7 @@ class ContourDenoiser(nn.Module):
         t_vec = self.time_mlp(timestep_embedding(t, self.hidden_dim))
         t_emb = t_vec.unsqueeze(1)
 
-        # NEW: the local sampler only ever sees the truncated (finer) subset
+        # the local sampler only ever sees the truncated (finer) subset
         # of cond_maps; the global branch (below) always uses the full list.
         if self.local_drop_coarsest > 0:
             local_maps = cond_maps[: len(cond_maps) - self.local_drop_coarsest]

@@ -103,31 +103,25 @@ class Config:
     lambda_nearest:float = 1.0
     nearest_gamma:float = 1.0
 
-    # ----- boundary snapper (post-DDIM, teacher-trained) -----
-    # Separates Modul (src/snapper.py). Läuft NICHT im Diffusions-Forward-Pass,
-    # sondern als Post-Processing-Schritt nach dem fertigen DDIM-Sampling
-    # (siehe sample.py: evaluate(..., snapper=...)). Wird über einen separaten
-    # Teacher-Loss trainiert (perturb_along_normals auf GT, kein On-Policy-
-    # Training auf echten Diffusions-Zwischenständen) -- additiv zum normalen
-    # Diffusions-Loss in train.py.
-    lambda_snap: float = 1.0                    # Gewicht des Snapper-Teacher-Loss im Gesamt-Loss
-    snap_n_samples: int = 11                    # Profil-Samples entlang der Normalen (ungerade erzwungen)
-    snap_radius: float = 0.10                   # max. Normal-Suchradius (gleicher [-1,1]-Koordinatenraum wie Punkte)
-    snap_levels: int = 2                        # wie viele (feinste) Backbone-Skalen gesampelt werden
-    snap_profile_dim: int = 20                  # Kanalzahl der projizierten Profil-Features
-    snap_hidden_dim: int = 64                   # Hidden-Dim im Snapper-Transformer/Conv-Block
-    snap_ring_bands: int = 4                    # Harmonische des fixen Ring-Positions-Features
-    snap_num_heads: int = 4                     # Attention-Heads im Ring-Kommunikationsblock
-    snap_relative_bias: float = 0.12            # Stärke des zyklischen Attention-Bias (nahe Nachbarn bevorzugt)
-    snap_confidence_power: float = 2.0          # Schärfe des Confidence-Gates (sigmoid(conf)^power)
-    snap_use_rgb: bool = True                   # zusätzlich rohes RGB an den Profil-Punkten sampeln
-    snap_perturb_offset: float = 0.08           # max. Normal-Perturbation für die Teacher-Konturen
-    snap_perturb_smooth: int = 2                # Glättungs-Pässe der Teacher-Perturbation
-    snap_confidence_radius: float = 0.060       # Nearest-GT-Abstand, unterhalb dessen ein Vertex "confident" ist
-    snap_tangent_tolerance: float = 0.040       # max. tangentiale Verschiebung für "confident"
-    lambda_snap_onpolicy: float = 0.0            # 0.0 = aus; zusaetzlicher On-Policy-Loss
-    snap_onpolicy_warmup_epochs: int = 10        # Epochen bis zur Aktivierung
-    snap_onpolicy_ramp_epochs: int = 10          # lineare Rampe nach Warmup; 0 = sofort voll
+
+    lambda_snap: float = 1.0                    # Weight of the snapper teacher loss in the total loss
+    snap_n_samples: int = 11                    # Number of profile samples along the normal (odd number enforced)
+    snap_radius: float = 0.10                   # Maximum normal search radius (same [-1,1] coordinate space as points)
+    snap_levels: int = 2                        # Number of finest backbone scales to sample
+    snap_profile_dim: int = 20                  # Channel count of projected profile features
+    snap_hidden_dim: int = 64                   # Hidden dimension in the snapper Transformer/Conv block
+    snap_ring_bands: int = 4                    # Harmonics of the fixed ring positional features
+    snap_num_heads: int = 4                     # Attention heads in the ring communication block
+    snap_relative_bias: float = 0.12            # Strength of the cyclic attention bias (favoring nearby neighbors)
+    snap_confidence_power: float = 2.0          # Sharpness of the confidence gate (sigmoid(conf)^power)
+    snap_use_rgb: bool = True                   # Additionally sample raw RGB values at profile points
+    snap_perturb_offset: float = 0.08            # Maximum normal perturbation for teacher contours
+    snap_perturb_smooth: int = 2                 # Number of smoothing passes for teacher perturbations
+    snap_confidence_radius: float = 0.060       # Nearest-GT distance below which a vertex is considered confident
+    snap_tangent_tolerance: float = 0.040       # Maximum tangential displacement for a vertex to be considered confident
+    lambda_snap_onpolicy: float = 0.0            # 0.0 = disabled; additional on-policy loss
+    snap_onpolicy_warmup_epochs: int = 10        # Number of epochs before activation
+    snap_onpolicy_ramp_epochs: int = 10          # Linear ramp after warmup; 0 = full strength immediately
     lambda_snap_biou: float = 1.0
     snap_biou_size: int = 64
     proposal_target: str = "residual"                    # "absolute" | "residual"; see apply_proposal_target()
@@ -137,22 +131,12 @@ class Config:
     lambda_proposal_dice: float = 1.0                    # weight of the proposal-dice loss (independent of the denoiser)
     lambda_curvature: float = 1.0                    # weight of the curvature penalty loss (see diffusion.py)
     curvature_gamma: float = 1.0                    # gamma for the curvature penalty loss (see diffusion.py)
-    # V6: shape parametrization + multi-shape union. n_shapes==1 (default)
-    # reproduces the old single-shape V5 proposal exactly; see
-    # models/proposal.py's module docstring for the full union/differentiability
-    # design (soft-OR union for training gradient, non-differentiable
-    # cv2.findContours re-extraction for the point-contour path).
     proposal_type: str = "fourier"                 # "fourier" | "ellipse" -- per-shape parametrization
     proposal_n_shapes: int = 1                     # number of independent shape queries whose union forms the proposal
     proposal_union_raster_size: int = 64           # raster resolution for the multi-shape soft-union mask (n_shapes>1 only)
     guidance_time_scale: float = 0.0        # scale down the guidance signal linearly with timestep (0=off, 1=full)
     lambda_sensitivity: float = 0.0                    # weight of the sensitivity loss (see diffusion.py)
     sensitivity_min_ratio: float = 0.5                    # min ratio of sensitivity loss to MSE loss (see diffusion.py)
-    # ----- V6: in-loop boundary snapping (applied during ddim_sample) -----
-    # Controls WHEN/HOW the (separately, teacher-)trained BoundarySnapper is
-    # applied at eval/sample time -- see sample.py's evaluate() and
-    # diffusion.py's ddim_sample. Does NOT affect snapper training itself
-    # (still lambda_snap / teacher_loss above, unchanged).
     snap_mode: str = "post"                        # "post" | "loop" | "both" | "none"
     snap_t_threshold_frac: float = 0.15            # in-loop snapping only in the last X% of timesteps (0..1), "loop"/"both"
     snap_every: int = 1                            # snap every N-th eligible low-t DDIM step ("loop"/"both")

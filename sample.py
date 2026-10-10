@@ -21,10 +21,6 @@ from .models import ContourDenoiser, build_conditioner, BoundarySnapper, Contour
 from .utils import dice_score, iou_score, points_to_mask, save_prediction_grid
 
 
-# ---------------------------------------------------------------------------
-# NEW: GIF rendering of the denoising trajectory (--gif / --gif_steps).
-# ---------------------------------------------------------------------------
-
 def _render_denoising_gif(image_chw, gt_points, intermediates, gif_path,
                            img_size=None, fps=4):
     """Render one sample's denoising trajectory to an animated GIF.
@@ -130,7 +126,6 @@ def evaluate(encoder, denoiser, diffusion, loader, cfg, device, snapper=None,
     (`proposal_head.n_shapes > 1`) transparently -- `proposal_head(raw)`
     always returns a single [B, n_points, 2] contour regardless of n_shapes.
 
-    --- NEW: denoising-trajectory GIF (V7) ---------------------------------
     gif: if True, renders an animated GIF of the DDIM denoising trajectory
         (noisy -> clean contour) for the first `gif_n_samples` items of the
         FIRST batch only (matching how `viz_path`'s PNG grid is cached from
@@ -181,9 +176,6 @@ def evaluate(encoder, denoiser, diffusion, loader, cfg, device, snapper=None,
         cond_fn = lambda t_b: encoder.fuse(raw, t_b)   # time-conditioned per step
         shape = (images.shape[0], cfg.n_points, 2)
 
-        # NEW: only request intermediates on the very first batch (the one
-        # we'll actually render), to avoid needlessly holding onto the full
-        # trajectory tensor list for every batch in the loader.
         want_gif_this_batch = gif and not gif_rendered
         sample_out = diffusion.ddim_sample(
             denoiser, cond_fn, shape,
@@ -292,27 +284,13 @@ def load_checkpoint(ckpt_path, cfg, device):
                   "snap_relative_bias", "snap_confidence_power", "snap_use_rgb",
                   "proposal_target", "proposal_harmonics", "proposal_hidden_dim",
                   "proposal_num_heads",
-                  # V6: multi-shape / shape-type proposal knobs.
                   "proposal_type", "proposal_n_shapes", "proposal_union_raster_size",
-                  # V6: in-loop snapping knobs (needed at eval/sample time,
-                  # not part of the model's own state_dict).
+
                   "snap_mode", "snap_t_threshold_frac", "snap_every",
-                  # needed to reconstruct the denoiser's forward-pass wiring
-                  # (residual_target) identically to how it was trained.
+
                   "predict_residual", "pos_scale", "attn_mask", "timesteps",
                   "guidance_time_scale",
-                  # NEW: multi-scale sampling strategy ablation (see
-                  # models/denoiser.py: MultiScalePointSampler /
-                  # DeformableScalePointSampler / AttentionScalePointSampler).
-                  # `sampler_type` is the current, authoritative field;
-                  # `use_deformable_sampling` is kept for older checkpoints
-                  # that predate `sampler_type` (see _resolve_sampler_type
-                  # above -- same backward-compat rule ContourDenoiser
-                  # applies internally). Checkpoints missing ANY of these
-                  # keys simply skip them here and cfg keeps its dataclass
-                  # default (sampler_type="input",
-                  # use_deformable_sampling=False) -- old checkpoints load
-                  # exactly as before, no migration needed.
+
                   "sampler_type", "use_deformable_sampling",
                   "deform_n_samples", "deform_min_scale_res", "deform_radius_cells",
                   "attn_sampler_window", "attn_sampler_heads",
@@ -343,15 +321,6 @@ def load_checkpoint(ckpt_path, cfg, device):
         predict_residual=cfg.predict_residual,
         residual_target=residual_target,
         guidance_time_scale=cfg.guidance_time_scale,
-        # NEW: multi-scale sampling strategy ablation. `sampler_type` is
-        # passed explicitly as the already-resolved value (see
-        # _resolve_sampler_type above) so this is correct for BOTH old
-        # checkpoints (only had use_deformable_sampling) and new ones
-        # (have sampler_type directly, incl. "attention"). getattr(...)
-        # defaults match Config's dataclass defaults, so this is safe even
-        # if `cfg` was ever constructed some other way that skipped them
-        # (belt-and-suspenders; with the whitelist above, a real Config
-        # will always have these set after loading a checkpoint).
         sampler_type=sampler_type,
         use_deformable_sampling=getattr(cfg, "use_deformable_sampling", False),
         deform_n_samples=getattr(cfg, "deform_n_samples", 4),

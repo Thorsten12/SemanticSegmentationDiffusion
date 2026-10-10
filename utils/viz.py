@@ -64,17 +64,7 @@ def _sigma_to_heatmap(pred_points_np, sigma_np, H, W, blur_radius=7):
 def save_prediction_grid(images, gt_points, pred_points, gt_masks, pred_masks,
                          out_path, max_samples=4, scores=None, log_sigma=None,
                          proposal_points=None):
-    """... (docstring wie vorher, plus:)
-
-    proposal_points : [B, N, 2] tensor or None – deterministic coarse-contour
-                       proposal (V5/V6, see models/proposal.py). When given,
-                       an extra column shows it (dashed blue) overlaid on the
-                       prediction, so you can see how much the diffusion
-                       residual moved away from the proposal's initial guess.
-                       Ignored if log_sigma is also given (uncertainty column
-                       takes priority; both are visualization-only extras and
-                       rarely needed together).
-    """
+    
     has_uncertainty = log_sigma is not None
     has_proposal = proposal_points is not None and not has_uncertainty
     n_cols = 3 + int(has_uncertainty) + int(has_proposal)
